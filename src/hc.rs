@@ -669,23 +669,29 @@ pub(crate) mod tests {
 
     /// An isolated core (own HC_SESSION and XDG dirs under /var/tmp), from the
     /// fork binary in `HERDR_CORE_BIN` (default `../herdr-core/target/debug/herdr-core`).
+    #[cfg(unix)]
     pub(crate) struct Isolated {
         root: std::path::PathBuf,
         bin: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl Isolated {
-        pub(crate) fn new(name: &str) -> Isolated {
+        /// `None` (skip the test) when there is no fork core to run.
+        pub(crate) fn new(name: &str) -> Option<Isolated> {
+            let bin = std::env::var_os("HERDR_CORE_BIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../herdr-core/target/debug/herdr-core"));
+            if !bin.exists() {
+                eprintln!("no core binary at {bin:?} (build the fork or set HERDR_CORE_BIN); skipping");
+                return None;
+            }
             let root = std::path::PathBuf::from(format!("/var/tmp/herdr-app-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             for dir in ["run", "state", "config"] {
                 std::fs::create_dir_all(root.join(dir)).unwrap();
             }
-            let bin = std::env::var_os("HERDR_CORE_BIN")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../herdr-core/target/debug/herdr-core"));
-            assert!(bin.exists(), "no core binary at {bin:?}: build the fork or set HERDR_CORE_BIN");
-            Isolated { root, bin }
+            Some(Isolated { root, bin })
         }
 
         /// A connection to this core.
@@ -707,6 +713,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Isolated {
         fn drop(&mut self) {
             let _ = self.command().args(["server", "stop"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
@@ -714,6 +721,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     /// Reads from a stream until `want` bytes arrived or `Closed`/`Lost` (or 2 s pass).
     fn read_until(rx: &async_channel::Receiver<Stream>, want: usize) -> (Vec<u8>, bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -731,9 +739,10 @@ pub(crate) mod tests {
         (got, false)
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_socket_echoes() {
-        let iso = Isolated::new("echo");
+        let Some(iso) = Isolated::new("echo") else { return };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -752,9 +761,10 @@ pub(crate) mod tests {
         core.detach(opened.channel);
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_socket_close_on_peer_eof() {
-        let iso = Isolated::new("eof");
+        let Some(iso) = Isolated::new("eof") else { return };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || drop(listener.accept().unwrap()));

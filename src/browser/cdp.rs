@@ -451,6 +451,7 @@ mod tests {
         assert!(!ts.apply("Page.frameNavigated", &json!({})));
     }
 
+    #[cfg(unix)]
     /// A channel through a real (fork) core whose peer is a plain listener.
     /// Returns the core, the transport and the peer's side of the socket.
     fn core_channel(iso: &crate::hc::tests::Isolated) -> (Arc<Core>, CoreTransport, TcpStream) {
@@ -462,6 +463,7 @@ mod tests {
         (core.clone(), CoreTransport::new(core, opened), peer)
     }
 
+    #[cfg(unix)]
     /// True once the peer reads end of stream (within 5 s).
     fn peer_sees_eof(mut peer: TcpStream) -> bool {
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -469,18 +471,20 @@ mod tests {
         matches!(peer.read(&mut buf), Ok(0))
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_a_core_transport_closes_its_channel() {
-        let iso = crate::hc::tests::Isolated::new("transport-drop");
+        let Some(iso) = crate::hc::tests::Isolated::new("transport-drop") else { return };
         let (_core, transport, peer) = core_channel(&iso);
         // e.g. a connect cancelled before it handed the transport on
         drop(transport);
         assert!(peer_sees_eof(peer), "the core kept the socket open");
     }
 
+    #[cfg(unix)]
     #[test]
     fn closing_then_dropping_a_core_transport_detaches_once() {
-        let iso = crate::hc::tests::Isolated::new("transport-close");
+        let Some(iso) = crate::hc::tests::Isolated::new("transport-close") else { return };
         let (core, transport, peer) = core_channel(&iso);
         transport.close();
         drop(transport);

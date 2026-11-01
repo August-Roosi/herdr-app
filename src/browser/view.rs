@@ -865,9 +865,10 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn setup_gives_up_on_a_port_that_never_answers() {
-        let iso = crate::hc::tests::Isolated::new("browser-mute");
+        let Some(iso) = crate::hc::tests::Isolated::new("browser-mute") else { return };
         let core = iso.connect();
         // accepts, never answers
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -905,12 +906,13 @@ mod tests {
         assert_eq!(late.unwrap_err().to_string(), "the thing: no answer in 50ms");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "needs HERDR_TEST_CHROMIUM (a chrome binary) and the fork's core; run with --include-ignored"]
     fn finds_a_labeled_browser_through_the_core_and_shows_it() {
         use crate::browser::testutil::{Chromium, chromium_bin};
         let Some(bin) = chromium_bin() else { return };
-        let iso = crate::hc::tests::Isolated::new("browser-view");
+        let Some(iso) = crate::hc::tests::Isolated::new("browser-view") else { return };
         let core = iso.connect();
         let chrome = Chromium::start(&bin);
         let tried = |agent: &str| cdp::block_on(attempt(&core, agent, (800, 600)));
