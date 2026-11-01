@@ -193,6 +193,11 @@ impl std::fmt::Display for RpcError {
 }
 impl std::error::Error for RpcError {}
 
+/// The core has no such method: it is older than the call (e.g. no `socket.open`).
+pub fn too_old(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcError>().is_some_and(|r| r.kind() == Some("unknown_method") || r.0.get("code").and_then(Value::as_i64) == Some(-32601))
+}
+
 pub fn error_kind(error: &anyhow::Error) -> Option<&str> {
     error.downcast_ref::<RpcError>().and_then(RpcError::kind)
 }
@@ -245,6 +250,11 @@ pub struct Core {
     lost: async_channel::Receiver<()>,
 }
 
+pub struct Opened {
+    pub channel: u32,
+    pub stream: async_channel::Receiver<Stream>,
+}
+
 pub struct Attached {
     pub channel: u32,
     pub stream: async_channel::Receiver<Stream>,
@@ -273,7 +283,12 @@ fn read_frame(r: &mut impl Read) -> Option<(u32, u8, Vec<u8>)> {
 impl Core {
     /// Connects to the user's core (starting it if needed) and switches to framed mode.
     pub fn connect() -> Result<Arc<Core>> {
-        let mut child = crate::spawn::command(crate::core_bin::path())
+        Self::connect_with(crate::spawn::command(crate::core_bin::path()))
+    }
+
+    /// `connect` with the core command already prepared (binary and environment).
+    fn connect_with(mut command: std::process::Command) -> Result<Arc<Core>> {
+        let mut child = command
             .arg("connect")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -426,6 +441,32 @@ impl Core {
         Ok(Attached { channel, stream: rx, terminal: result["terminal"].clone() })
     }
 
+    /// Opens a socket the core connects to (a loopback `host:port` or a unix
+    /// path), here or on another machine (`on`). The channel carries the
+    /// socket's bytes both ways; `detach` closes it.
+    pub fn open_socket(&self, address: &str, on: Option<&str>) -> Result<Opened> {
+        let mut params = json!({"address": address});
+        if let Some(on) = on {
+            params["on"] = json!(on);
+        }
+        let result = self.call("socket.open", params)?;
+        let channel = result["channel"].as_u64().ok_or_else(|| anyhow!("socket.open returned no channel"))? as u32;
+        let (tx, rx) = async_channel::unbounded();
+        let mut r = self.routes.lock().unwrap();
+        for item in r.early.remove(&channel).unwrap_or_default() { let _ = tx.try_send(item); }
+        r.streams.insert(channel, tx);
+        drop(r);
+        self.credit(channel, 1024 * 1024);
+        Ok(Opened { channel, stream: rx })
+    }
+
+    /// Writes to a channel (a socket from `open_socket`) in frames of at most 1 MiB.
+    pub fn write(&self, channel: u32, bytes: &[u8]) {
+        for chunk in bytes.chunks(1024 * 1024) {
+            self.send(channel, DATA, chunk);
+        }
+    }
+
     pub fn input(&self, channel: u32, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.send(channel, DATA, bytes);
@@ -567,5 +608,107 @@ mod tests {
         assert_eq!(check(&hello(1, "9.9.9", &["terminal.run"])), Err(Mismatch::Missing(USES[1..].iter().map(|m| m.to_string()).collect())));
         // 0.10 is newer than 0.9 (numbers, not text).
         assert!(semver("0.10.0") > semver("0.9.3"));
+    }
+
+    /// An isolated core (own HC_SESSION and XDG dirs under /var/tmp), from the
+    /// fork binary in `HERDR_CORE_BIN` (default `../herdr-core/target/debug/herdr-core`).
+    struct Isolated {
+        root: std::path::PathBuf,
+        bin: std::path::PathBuf,
+    }
+
+    impl Isolated {
+        fn new(name: &str) -> Isolated {
+            let root = std::path::PathBuf::from(format!("/var/tmp/herdr-app-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for dir in ["run", "state", "config"] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            let bin = std::env::var_os("HERDR_CORE_BIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../herdr-core/target/debug/herdr-core"));
+            assert!(bin.exists(), "no core binary at {bin:?}: build the fork or set HERDR_CORE_BIN");
+            Isolated { root, bin }
+        }
+
+        fn command(&self) -> std::process::Command {
+            let mut cmd = std::process::Command::new(&self.bin);
+            cmd.env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("HOME", &self.root)
+                .env("HC_SESSION", "test")
+                .env("XDG_RUNTIME_DIR", self.root.join("run"))
+                .env("XDG_STATE_HOME", self.root.join("state"))
+                .env("XDG_CONFIG_HOME", self.root.join("config"))
+                .env("HC_SETTLE_MS", "0");
+            cmd
+        }
+    }
+
+    impl Drop for Isolated {
+        fn drop(&mut self) {
+            let _ = self.command().args(["server", "stop"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Reads from a stream until `want` bytes arrived or `Closed`/`Lost` (or 2 s pass).
+    fn read_until(rx: &async_channel::Receiver<Stream>, want: usize) -> (Vec<u8>, bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Stream::Data(d)) => {
+                    got.extend(d);
+                    if got.len() >= want { return (got, false); }
+                }
+                Ok(Stream::Closed(_)) | Ok(Stream::Lost) => return (got, true),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        (got, false)
+    }
+
+    #[test]
+    fn open_socket_echoes() {
+        let iso = Isolated::new("echo");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 || s.write_all(&buf[..n]).is_err() { break; }
+            }
+        });
+        let core = Core::connect_with(iso.command()).unwrap();
+        let opened = core.open_socket(&addr, None).unwrap();
+        core.write(opened.channel, b"ping");
+        let (got, closed) = read_until(&opened.stream, 4);
+        assert_eq!(got, b"ping");
+        assert!(!closed);
+        core.detach(opened.channel);
+    }
+
+    #[test]
+    fn open_socket_close_on_peer_eof() {
+        let iso = Isolated::new("eof");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let core = Core::connect_with(iso.command()).unwrap();
+        let opened = core.open_socket(&addr, None).unwrap();
+        let (_, closed) = read_until(&opened.stream, usize::MAX);
+        assert!(closed, "the peer closed, so the channel should close");
+    }
+
+    #[test]
+    fn open_socket_method_not_found_maps_to_too_old() {
+        let unknown = json!({"code": -32601, "message": "unknown method \"socket.open\"", "data": {"kind": "unknown_method", "hint": "see `hc schema`"}});
+        let e = anyhow::Error::new(RpcError(unknown)).context("socket.open");
+        assert!(too_old(&e));
+        let refused = json!({"code": -32000, "message": "refused", "data": {"kind": "refused", "hint": ""}});
+        assert!(!too_old(&anyhow::Error::new(RpcError(refused)).context("socket.open")));
+        assert!(!too_old(&anyhow!("socket.open: no reply from core")));
     }
 }
