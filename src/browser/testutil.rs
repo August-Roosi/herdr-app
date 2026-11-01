@@ -64,6 +64,7 @@ pub const PAGE: &str = "data:text/html,<style>html,body{margin:0;height:100%25;b
 /// group) and its profile removed on drop.
 pub struct Chromium {
     bin: String,
+    url: String,
     child: std::process::Child,
     dir: std::path::PathBuf,
     pub port: u16,
@@ -71,11 +72,16 @@ pub struct Chromium {
 
 impl Chromium {
     pub fn start(bin: &str) -> Chromium {
+        Self::start_on(bin, PAGE)
+    }
+
+    /// Starts showing `url`.
+    pub fn start_on(bin: &str, url: &str) -> Chromium {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let dir = std::path::PathBuf::from(format!("/var/tmp/herdr-cdp-test-{}-{port}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let child = Self::spawn(bin, port, &dir);
-        Chromium { bin: bin.to_string(), child, dir, port }
+        let child = Self::spawn(bin, url, port, &dir);
+        Chromium { bin: bin.to_string(), url: url.to_string(), child, dir, port }
     }
 
     /// Kills the browser and starts it again on the same port and profile.
@@ -87,10 +93,10 @@ impl Chromium {
             assert!(Instant::now() < deadline, "port {} still open after kill", self.port);
             std::thread::sleep(Duration::from_millis(50));
         }
-        self.child = Self::spawn(&self.bin, self.port, &self.dir);
+        self.child = Self::spawn(&self.bin, &self.url, self.port, &self.dir);
     }
 
-    fn spawn(bin: &str, port: u16, dir: &std::path::Path) -> std::process::Child {
+    fn spawn(bin: &str, url: &str, port: u16, dir: &std::path::Path) -> std::process::Child {
         use std::os::unix::process::CommandExt as _;
         let child = std::process::Command::new(bin)
             .args([
@@ -100,7 +106,7 @@ impl Chromium {
                 "--no-sandbox",
                 &format!("--user-data-dir={}", dir.display()),
                 "--window-size=1280,800",
-                PAGE,
+                url,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

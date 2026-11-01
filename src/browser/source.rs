@@ -93,6 +93,8 @@ pub struct CdpScreencast {
 struct Stats {
     frames: AtomicU64,
     micros: AtomicU64,
+    /// The most calls ever in flight at once.
+    flights: AtomicU64,
 }
 
 impl CdpScreencast {
@@ -111,7 +113,12 @@ impl CdpScreencast {
             Ok(d) => d,
             Err(e) => return Self::failed(cmds, stats, e),
         };
+        // closes the slot (ending the decoder) however the worker ends: also
+        // when it panics or never starts
+        let guard = CloseOnDrop(slot.clone());
+        let worker_stats = stats.clone();
         let worker = std::thread::Builder::new().name("cdp-screencast".into()).spawn(move || {
+            let _guard = guard;
             let mut w = Worker {
                 cdp: Arc::new(cdp),
                 out: out.clone(),
@@ -125,6 +132,8 @@ impl CdpScreencast {
                 flights: Vec::new(),
                 held: None,
                 events_first: false,
+                move_pending: None,
+                stats: worker_stats,
             };
             let r = w.run(cmd_rx, ack_rx);
             slot.close();
@@ -144,6 +153,11 @@ impl CdpScreencast {
         let (out, frames) = Out::new();
         out.push(SourceEvent::Ended);
         CdpScreencast { cmds, frames, stats }
+    }
+
+    /// The most calls the worker had in flight at once.
+    pub fn max_in_flight(&self) -> u64 {
+        self.stats.flights.load(Ordering::Relaxed)
     }
 
     /// Frames decoded so far and the total time spent decoding them.
@@ -198,6 +212,14 @@ impl Out {
             }
         }
         let _ = self.tx.try_send(ev);
+    }
+}
+
+struct CloseOnDrop(Arc<Slot>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -276,6 +298,8 @@ type Reply = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
 struct Flight {
     reply: Reply,
     deadline: Instant,
+    /// A `mouseMoved`: at most one is in flight.
+    is_move: bool,
 }
 
 struct Worker {
@@ -295,6 +319,9 @@ struct Worker {
     held: Option<Cmd>,
     /// Alternates which of commands and events `next` looks at first.
     events_first: bool,
+    /// The latest mouse move, waiting for the one in flight to finish.
+    move_pending: Option<PageInput>,
+    stats: Arc<Stats>,
 }
 
 enum Next {
@@ -340,12 +367,13 @@ impl Worker {
         }
         self.events_first = !self.events_first;
         let events_first = self.events_first;
-        let deadline = self.flights.iter().map(|f| f.deadline).min();
-        let (flights, cdp) = (&mut self.flights, &self.cdp);
+        let (flights, move_pending, cdp) = (&mut self.flights, &mut self.move_pending, &self.cdp);
+        // the earliest deadline of calls still in flight: when to look again
+        let wake = std::cell::Cell::new(None);
         let mut e = std::pin::pin!(events.recv());
         let mut c = std::pin::pin!(cmds.recv());
         let mut a = std::pin::pin!(acks.recv());
-        let next = block_on_deadline(
+        block_on_wake(
             std::future::poll_fn(|cx| {
                 let mut lost = false;
                 flights.retain_mut(|f| match f.reply.as_mut().poll(cx) {
@@ -358,8 +386,19 @@ impl Worker {
                         false
                     }
                 });
+                let now = Instant::now();
+                if flights.iter().any(|f| f.deadline <= now) {
+                    tracing::warn!("browser: a call went unanswered for {CALL_TIMEOUT:?}");
+                    lost = true;
+                }
                 if lost {
                     return Poll::Ready(Err(Gone));
+                }
+                wake.set(flights.iter().map(|f| f.deadline).min());
+                if !flights.iter().any(|f| f.is_move)
+                    && let Some(m) = move_pending.take()
+                {
+                    return Poll::Ready(Ok(Next::Cmd(Cmd::Input(m))));
                 }
                 if let Poll::Ready(Ok(ack)) = a.as_mut().poll(cx) {
                     return Poll::Ready(Ok(Next::Ack(ack)));
@@ -385,17 +424,13 @@ impl Worker {
                     ev(cx)
                 }
             }),
-            deadline,
-        );
-        next.unwrap_or_else(|| {
-            tracing::warn!("browser: a call went unanswered for {CALL_TIMEOUT:?}");
-            Err(Gone)
-        })
+            &wake,
+        )
     }
 
     /// A call's result or CDP error; `Gone` on timeout or a closed connection.
     fn call(&self, method: &str, params: Value, session: Option<&str>) -> Result<Result<Value, anyhow::Error>, Gone> {
-        match block_on_deadline(self.cdp.call(method, params, session), Some(Instant::now() + CALL_TIMEOUT)) {
+        match block_on_deadline(self.cdp.call(method, params, session), Instant::now() + CALL_TIMEOUT) {
             None => {
                 tracing::warn!("browser: {method} unanswered for {CALL_TIMEOUT:?}");
                 Err(Gone)
@@ -412,12 +447,17 @@ impl Worker {
 
     /// Sends a call now; `next` collects its reply (or its timeout).
     fn fire(&mut self, method: &str, params: Value, session: Option<&str>) {
+        self.fire_flight(method, params, session, false);
+    }
+
+    fn fire_flight(&mut self, method: &str, params: Value, session: Option<&str>, is_move: bool) {
         let (cdp, method, session) = (self.cdp.clone(), method.to_string(), session.map(str::to_string));
         let mut reply: Reply = Box::pin(async move { cdp.call(&method, params, session.as_deref()).await });
         // the first poll sends the request
         let waker = std::task::Waker::noop();
         if reply.as_mut().poll(&mut std::task::Context::from_waker(waker)).is_pending() {
-            self.flights.push(Flight { reply, deadline: Instant::now() + CALL_TIMEOUT });
+            self.flights.push(Flight { reply, deadline: Instant::now() + CALL_TIMEOUT, is_move });
+            self.stats.flights.fetch_max(self.flights.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -529,6 +569,17 @@ impl Worker {
     fn input(&mut self, i: PageInput) -> Result<(), Gone> {
         let Some(session) = self.shown.as_ref().map(|s| s.session.clone()) else { return Ok(()) };
         let session = Some(session.as_str());
+        match &i {
+            PageInput::Mouse { kind: MouseKind::Move, .. } if self.flights.iter().any(|f| f.is_move) => {
+                // one move in flight at a time; only the latest waits
+                self.move_pending = Some(i);
+                return Ok(());
+            }
+            // a press, release or wheel carries its own position
+            PageInput::Mouse { .. } | PageInput::Wheel { .. } => self.move_pending = None,
+            _ => {}
+        }
+        let is_move = matches!(i, PageInput::Mouse { kind: MouseKind::Move, .. });
         let calls: Vec<(&str, Value)> = match i {
             PageInput::Mouse { kind, x, y, button, clicks } => {
                 let bit = match button {
@@ -573,7 +624,7 @@ impl Worker {
             }
         };
         for (method, params) in calls {
-            self.fire(method, params, session);
+            self.fire_flight(method, params, session, is_move);
         }
         Ok(())
     }
@@ -612,8 +663,9 @@ fn decode(params: &Value) -> Option<Frame> {
     Some(Frame { image: Arc::new(gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(img)])), page })
 }
 
-/// Drives `f` on this thread until it ends or `deadline` passes (`None`).
-fn block_on_deadline<F: Future>(f: F, deadline: Option<Instant>) -> Option<F::Output> {
+/// Drives `f` on this thread to its end, also polling it again when the
+/// time `f` left in `wake` comes.
+fn block_on_wake<F: Future>(f: F, wake: &std::cell::Cell<Option<Instant>>) -> F::Output {
     use std::task::{Context, Wake, Waker};
     struct Unpark(std::thread::Thread);
     impl Wake for Unpark {
@@ -626,19 +678,27 @@ fn block_on_deadline<F: Future>(f: F, deadline: Option<Instant>) -> Option<F::Ou
     let mut f = std::pin::pin!(f);
     loop {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
-            return Some(v);
+            return v;
         }
-        match deadline {
+        match wake.get() {
             None => std::thread::park(),
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    return None;
-                }
-                std::thread::park_timeout(d - now);
-            }
+            Some(t) => std::thread::park_timeout(t.saturating_duration_since(Instant::now())),
         }
     }
+}
+
+/// Drives `f` on this thread until it ends or `deadline` passes (`None`).
+fn block_on_deadline<F: Future>(f: F, deadline: Instant) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    let wake = std::cell::Cell::new(Some(deadline));
+    block_on_wake(
+        std::future::poll_fn(|cx| match f.as_mut().poll(cx) {
+            Poll::Ready(v) => Poll::Ready(Some(v)),
+            Poll::Pending if Instant::now() >= deadline => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }),
+        &wake,
+    )
 }
 
 #[cfg(test)]
@@ -846,6 +906,37 @@ mod tests {
         eprintln!("screencast during mouse moves: {:.1} fps, worst gap {worst_m:?}", m as f64 / 3.0);
         assert!(n >= 5 * 20, "{n} frames in 5 s");
         assert!(m >= 3 * 20, "{m} frames in 3 s of mouse moves");
+        // one move in flight at a time (plus acks and the like)
+        eprintln!("screencast: at most {} calls in flight", source.max_in_flight());
+        assert!(source.max_in_flight() <= 4, "{} calls in flight", source.max_in_flight());
+        source.stop();
+    }
+
+    #[test]
+    #[ignore = "needs HERDR_TEST_CHROMIUM (a chrome binary); run with --include-ignored"]
+    fn static_page_stays_alive() {
+        let Some(bin) = chromium_bin() else { return };
+        let chrome = Chromium::start_on(&bin, "data:text/html,hi");
+        let source = CdpScreencast::start(chrome.cdp(), (800, 600));
+        let rx = source.frames();
+        let f = wait(&rx, 5.0, "a first frame", frame);
+        let (x, y) = (f.page.0 as f64 / 2.0, f.page.1 as f64 / 2.0);
+        // let startup's late events (extension workers) pass, so the click's
+        // calls are the last thing the source waits on
+        std::thread::sleep(Duration::from_secs(3));
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            source.input(PageInput::Mouse { kind, x, y, button: MouseButton::Left, clicks: 1 });
+        }
+        // nothing changes for longer than a call's timeout: still alive
+        let start = Instant::now();
+        while start.elapsed() < CALL_TIMEOUT + Duration::from_secs(2) {
+            match rx.try_recv() {
+                Ok(SourceEvent::Ended) | Err(async_channel::TryRecvError::Closed) => panic!("ended after {:?} on a static page", start.elapsed()),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        source.input(PageInput::Nav(Nav::Go(PAGE.into())));
+        wait(&rx, 5.0, "a frame after navigating", |e| frame(e).filter(|f| pixel(f, 2, 32)[0] > 100 && pixel(f, 2, 32)[2] < 60));
         source.stop();
     }
 
