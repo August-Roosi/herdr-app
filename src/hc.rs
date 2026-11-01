@@ -443,7 +443,8 @@ impl Core {
 
     /// Opens a socket the core connects to (a loopback `host:port` or a unix
     /// path), here or on another machine (`on`). The channel carries the
-    /// socket's bytes both ways; `detach` closes it.
+    /// socket's bytes both ways; `detach` closes it. Only 1 MiB is credited up
+    /// front: callers must `credit` every byte they consume or the stream stalls.
     pub fn open_socket(&self, address: &str, on: Option<&str>) -> Result<Opened> {
         let mut params = json!({"address": address});
         if let Some(on) = on {
