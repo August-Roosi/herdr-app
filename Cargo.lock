@@ -3722,6 +3722,8 @@ dependencies = [
  "uds_windows",
  "windows-sys 0.61.2",
  "winresource",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

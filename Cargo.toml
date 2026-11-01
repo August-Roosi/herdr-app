@@ -35,6 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fancy-regex = "0.19"
 notify = "7"
 sha2 = "0.10"
+zune-core = "0.5"
+zune-jpeg = "0.5"
 
 [[test]]
 name = "shot_pixels"

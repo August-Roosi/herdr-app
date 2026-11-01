@@ -55,6 +55,11 @@ impl Transport for TcpTransport {
     }
 }
 
+/// The test page: white, red once clicked, and a 64 px canvas at the top
+/// left that is redrawn (differently) every animation frame, so the
+/// screencast always has a fresh frame to send.
+pub const PAGE: &str = "data:text/html,<style>html,body{margin:0;height:100%25;background:white}canvas{position:fixed;left:0;top:0}</style><body onclick=\"document.body.style.background='red'\"><canvas width=64 height=64></canvas><script>const c=document.querySelector('canvas').getContext('2d');let n=0;(function f(){n++;c.fillStyle='rgb(0,0,'+(128+n%25128)+')';c.fillRect(0,0,64,64);c.fillStyle='white';c.fillRect(n%2564,0,4,64);requestAnimationFrame(f)})()</script>";
+
 /// A headless Chromium on a free loopback port, killed (whole process
 /// group) and its profile removed on drop.
 pub struct Chromium {
@@ -95,7 +100,7 @@ impl Chromium {
                 "--no-sandbox",
                 &format!("--user-data-dir={}", dir.display()),
                 "--window-size=1280,800",
-                "about:blank",
+                PAGE,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
