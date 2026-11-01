@@ -68,15 +68,9 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        # A manual run may skip everything but Windows.
-        exclude: ${{ fromJSON(inputs.windows_only && '[{"target":"linux-x86_64"},{"target":"linux-aarch64"},{"target":"macos-aarch64"}]' || '[]') }}
-        include:
-          # Linux on the oldest Ubuntu we can: the app links the system's
-          # glibc, so this sets how old a distro it runs on.
-          - { target: linux-x86_64, runner: ubuntu-22.04 }
-          - { target: linux-aarch64, runner: ubuntu-22.04-arm }
-          - { target: macos-aarch64, runner: macos-15 }
-          - { target: windows-x86_64, runner: windows-2022 }
+        # A manual run may build only Windows (inputs.windows_only); the list is JSON
+        # because a job-level `if` cannot read the matrix.
+        include: ${{ fromJSON(inputs.windows_only && '[{"target":"windows-x86_64","runner":"windows-2022"}]' || '[{"target":"linux-x86_64","runner":"ubuntu-22.04"},{"target":"linux-aarch64","runner":"ubuntu-22.04-arm"},{"target":"macos-aarch64","runner":"macos-15"},{"target":"windows-x86_64","runner":"windows-2022"}]') }}
     runs-on: ${{ matrix.runner }}
     # Only tags can access the release environment's Apple certificate.
     environment: ${{ github.ref_type == 'tag' && 'release' || 'build' }}
