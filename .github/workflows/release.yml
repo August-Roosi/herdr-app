@@ -43,6 +43,11 @@ on:
       - .github/workflows/release.yml
   # Builds only; publishing needs a tag.
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build only the Windows target
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -70,6 +75,7 @@ jobs:
           - { target: linux-aarch64, runner: ubuntu-22.04-arm }
           - { target: macos-aarch64, runner: macos-15 }
           - { target: windows-x86_64, runner: windows-2022 }
+    if: ${{ !inputs.windows_only || matrix.target == 'windows-x86_64' }}
     runs-on: ${{ matrix.runner }}
     # Only tags can access the release environment's Apple certificate.
     environment: ${{ github.ref_type == 'tag' && 'release' || 'build' }}
