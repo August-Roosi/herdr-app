@@ -118,9 +118,9 @@ async fn connect(core: &Arc<Core>, found: &Found, px: (u32, u32)) -> Attempt {
 async fn connect_within(core: &Arc<Core>, found: &Found, px: (u32, u32), limit: Duration) -> Attempt {
     let on = found.machine.as_deref();
     let machine = on.unwrap_or(HERE).to_owned();
-    let has_socket = core.hello["methods"].as_array().is_none_or(|ms| ms.iter().any(|m| m == "socket.open"));
-    if on.is_none() && !has_socket {
-        return Attempt::TooOld(machine);
+    // checked before the agent's machine: its browser is reached through here too
+    if let Some(old) = too_old_here(&core.hello) {
+        return Attempt::TooOld(old);
     }
     let address = format!("127.0.0.1:{}", found.port);
     let open = || match core.open_socket(&address, on) {
@@ -144,6 +144,15 @@ async fn connect_within(core: &Arc<Core>, found: &Found, px: (u32, u32), limit: 
         Ok(cdp) => Attempt::Source(CdpScreencast::start(cdp, px)),
         Err(e) => Attempt::Failed(e),
     }
+}
+
+/// The machine to name as too old before trying to reach any agent's
+/// browser, judged from the local core's hello: every browser, also
+/// one on another machine, is reached through this computer's core, so its
+/// age shows first. A remote core's shows when `socket.open` is tried there.
+fn too_old_here(hello: &serde_json::Value) -> Option<String> {
+    let has_socket = hello["methods"].as_array().is_none_or(|ms| ms.iter().any(|m| m == "socket.open"));
+    (!has_socket).then(|| HERE.to_owned())
 }
 
 /// Hands a source's events to the view until it ends. False once the view is gone.
@@ -729,6 +738,18 @@ mod tests {
         assert_eq!(state_text(&State::TooOld("rohan".into())).unwrap(), "core on rohan is too old for the browser pane");
         assert_eq!(state_text(&State::Connecting).unwrap(), "connecting…");
         assert_eq!(state_text(&State::Live), None);
+    }
+
+    #[test]
+    fn a_local_core_without_sockets_is_too_old_for_every_agent() {
+        let old = json!({"methods": ["terminal.list"]});
+        let new = json!({"methods": ["terminal.list", "socket.open"]});
+        // named for local and remote agents alike (connect_within asks before
+        // looking at the agent's machine)
+        assert_eq!(too_old_here(&old).as_deref(), Some(HERE));
+        assert_eq!(too_old_here(&new), None);
+        // a hello without a method list: try
+        assert_eq!(too_old_here(&json!({})), None);
     }
 
     #[test]
