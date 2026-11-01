@@ -45,7 +45,7 @@ function items(p, git) {
         ["Split right", "pane.split", { direction: "right", pane: tg.pane }],
         ["Split down", "pane.split", { direction: "down", pane: tg.pane }],
         ["Zoom", "pane.zoom", { pane: tg.pane }],
-        ...(hasBrowser ? [["Show browser", "browser.show", { terminal: term.address }]] : []),
+        ...(hasBrowser ? [["Show browser", "browser.show", { terminal: term.address, pane: tg.pane }]] : []),
         ...(term
           ? [
               toProgram

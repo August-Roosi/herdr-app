@@ -58,7 +58,7 @@ impl Drop for Staged {
 #[derive(Default)]
 struct Calls {
     unexpected: Vec<String>,
-    effects: Vec<(String, Vec<Value>)>,
+    effects: Effects,
     shared: BTreeMap<String, Value>,
 }
 
@@ -231,6 +231,20 @@ fn describe_with_values(
     values: BTreeMap<String, Value>,
     setup: Option<&str>,
 ) -> anyhow::Result<String> {
+    describe_with_effects(cx, staged, entry, values, setup).map(|(tree, _)| tree)
+}
+
+/// Host calls a mod made: (function, its first two arguments).
+type Effects = Vec<(String, Vec<Value>)>;
+
+/// `describe_with_values`, also returning the host calls the mod made (`run`, ...).
+fn describe_with_effects(
+    cx: &mut TestAppContext,
+    staged: &Staged,
+    entry: &str,
+    values: BTreeMap<String, Value>,
+    setup: Option<&str>,
+) -> anyhow::Result<(String, Effects)> {
     let calls = Rc::new(RefCell::new(Calls::default()));
     static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
     let policy = Policy::new()
@@ -249,7 +263,8 @@ fn describe_with_values(
     })?;
     window.update(cx, |_, window, _| window.remove_window())?;
     assert!(calls.borrow().unexpected.is_empty(), "{entry}: {:?}", calls.borrow().unexpected);
-    result
+    let effects = std::mem::take(&mut calls.borrow_mut().effects);
+    result.map(|tree| (tree, effects))
 }
 
 fn props() -> Value {
@@ -694,6 +709,16 @@ fn pane_menu_shows_browser_only_with_a_live_one(cx: &mut TestAppContext) {
     assert!(remote.contains("Show browser"), "{remote}");
     let local_only = menu(cx, json!([t("rohan/t1", json!({})), t("t2", json!({"browser-for":"t1"}))]), "rohan/t1");
     assert!(!local_only.contains("Show browser"), "{local_only}");
+    // Chosen, it opens beside the right-clicked pane (the 4th item).
+    let mut values = fixture(true, props(), updates("current", "current"));
+    let mut p = props();
+    p["tab"] = json!("pane");
+    p["target"] = json!({"pane":"p7","terminal":"t1"});
+    values.insert("props".into(), p);
+    values.insert("terminals".into(), json!([t("t1", json!({})), t("t2", json!({"browser-for":"t1"}))]));
+    let (_, effects) = describe_with_effects(cx, &staged, "mods/menu", values, Some("this.choose(3, cx);")).unwrap();
+    let ran: Vec<&Vec<Value>> = effects.iter().filter(|(name, _)| name == "run").map(|(_, args)| args).collect();
+    assert_eq!(ran, [&vec![json!("browser.show"), json!({"terminal":"t1","pane":"p7"})]], "{effects:?}");
 }
 
 #[gpui::test]
