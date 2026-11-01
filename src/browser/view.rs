@@ -637,9 +637,13 @@ impl Render for BrowserView {
                                     return;
                                 };
                                 let s = frame.image.size(0);
-                                let rect = fit(bounds, (s.width.0 as f32, s.height.0 as f32));
+                                let outer = fit(bounds, (s.width.0 as f32, s.height.0 as f32));
+                                // The page sits 1 px inside a line in the pane-border colour, so
+                                // its edge shows even when the page is as light as the letterbox.
+                                let rect = Bounds::new(outer.origin + point(px(1.0), px(1.0)), outer.size - size(px(2.0), px(2.0)));
                                 shared.rect = Some(rect);
                                 let _ = window.paint_image(rect, rect, Corners::default(), frame.image.clone(), 0, false);
+                                window.paint_quad(outline(outer, c("border"), BorderStyle::Solid));
                                 // Each frame is a new image: free the last one's atlas space.
                                 if let Some(old) = shared.painted.replace(frame.image.clone())
                                     && old.id != frame.image.id
@@ -792,6 +796,10 @@ mod tests {
             assert!(red(&at(500.0, 500.0)), "center: {:?}", at(500.0, 500.0));
             assert!(!red(&at(500.0, 50.0)), "letterbox: {:?}", at(500.0, 50.0));
             assert!(!red(&at(500.0, 10.0)), "top bar: {:?}", at(500.0, 10.0));
+            // the page's edge is marked, so a white page differs from the letterbox
+            assert!(!red(&at(0.5, 500.0)), "edge: {:?}", at(0.5, 500.0));
+            assert_ne!(at(0.5, 500.0), at(500.0, 50.0), "edge looks like the letterbox");
+            assert!(red(&at(3.0, 500.0)), "inside the edge: {:?}", at(3.0, 500.0));
             // the image area, in device px, is the screencast's size
             let area = ((1000.0 * scale) as u32, ((1000.0 - BAR - STATUS) * scale) as u32);
             let told = calls.lock().unwrap().clone();

@@ -670,6 +670,33 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn pane_menu_shows_browser_only_with_a_live_one(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let menu = |cx: &mut TestAppContext, terminals: Value, terminal: &str| {
+        let mut values = fixture(true, props(), updates("current", "current"));
+        let mut p = props();
+        p["tab"] = json!("pane");
+        p["target"] = json!({"pane":"p1","terminal":terminal});
+        values.insert("props".into(), p);
+        values.insert("terminals".into(), terminals);
+        describe_with_values(cx, &staged, "mods/menu", values, None).unwrap()
+    };
+    let t = |address: &str, labels: Value| json!({"address":address,"name":address,"title":address,"argv":["pi"],"parent":null,"labels":labels,"state":"running","status":"working","report":{},"program":null,"cwd":"/x"});
+    let none = menu(cx, json!([t("t1", json!({}))]), "t1");
+    assert!(none.contains("Zoom") && !none.contains("Show browser"), "{none}");
+    let live = menu(cx, json!([t("t1", json!({})), t("t2", json!({"browser-for":"t1"}))]), "t1");
+    assert!(live.contains("Show browser"), "{live}");
+    // Another machine's browser for the same bare id does not count.
+    let other = menu(cx, json!([t("t1", json!({})), t("rohan/t2", json!({"browser-for":"t1"}))]), "t1");
+    assert!(!other.contains("Show browser"), "{other}");
+    let remote = menu(cx, json!([t("rohan/t1", json!({})), t("rohan/t2", json!({"browser-for":"t1"}))]), "rohan/t1");
+    assert!(remote.contains("Show browser"), "{remote}");
+    let local_only = menu(cx, json!([t("rohan/t1", json!({})), t("t2", json!({"browser-for":"t1"}))]), "rohan/t1");
+    assert!(!local_only.contains("Show browser"), "{local_only}");
+}
+
+#[gpui::test]
 fn duplicate_element_negative_control(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();

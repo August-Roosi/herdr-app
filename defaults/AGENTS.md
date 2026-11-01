@@ -176,6 +176,7 @@ machine, and reconnects when it restarts. Until the agent browses it says
   (`place: "down"`, or `"tab"` for a new tab in the agent's space; `pane`
   splits beside another pane). Another machine's agent: `rohan/t3`; its
   pane goes in a space on that machine. Showing one already shown focuses it.
+  The pane right-click menu has "Show browser" when the terminal has one.
 - `terminal: "base"` (`rohan/base`) is the login browser: log in there once
   and agents' browsers start with those cookies.
 - It is a pane like a mod pane: it splits, zooms, closes and is saved with

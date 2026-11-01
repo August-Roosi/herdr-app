@@ -1462,7 +1462,7 @@ impl AppWindow {
         self.focused_pane = focused.clone();
         let no_dialog = !self.overlays.iter().any(|o| o.kind.modal_keys());
         if terminal_block(&self.chrome, focused.as_deref()).is_some() {
-            if pane_changed && no_dialog && let Some(f) = focused.as_deref().and_then(|p| self.pane_focus(p)) {
+            if pane_changed && no_dialog && let Some(f) = focused.as_deref().and_then(|p| self.pane_focus(p, cx)) {
                 f.focus(window, cx);
             }
         } else if let Some(block) = self.agent_block() {
@@ -1479,7 +1479,7 @@ impl AppWindow {
             // A mod pane takes the keyboard on a click; until then the window holds
             // it, so another tab's terminal can't keep it (and pull its tab back).
             if no_dialog {
-                focused.and_then(|p| self.pane_focus(&p)).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
+                focused.and_then(|p| self.pane_focus(&p, cx)).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
             }
         }
         if self.window_active {
@@ -1537,11 +1537,11 @@ impl AppWindow {
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = self.overlays.iter().rev().find(|o| o.kind.modal_keys()).map(|o| o.focus.clone());
         let shown = if terminal_block(&self.chrome, self.focused_pane.as_deref()).is_some() {
-            self.focused_pane.as_deref().and_then(|p| self.pane_focus(p))
+            self.focused_pane.as_deref().and_then(|p| self.pane_focus(p, cx))
         } else if let Some(block) = self.agent_block() {
             self.shown_agent().and_then(|a| self.agent_view(&block, &a)).map(|t| t.focus.clone())
         } else if self.shows_tab() {
-            self.model.focused_pane().and_then(|p| self.pane_focus(&p))
+            self.model.focused_pane().and_then(|p| self.pane_focus(&p, cx))
         } else {
             None
         };
@@ -1560,8 +1560,9 @@ impl AppWindow {
             .or_else(|| self.model.focused_pane().and_then(|p| self.pane_term(&p)))
     }
 
-    fn pane_focus(&self, pane: &str) -> Option<FocusHandle> {
-        self.pane_term(pane).map(|t| t.focus.clone())
+    /// What takes the keyboard when a pane is focused: its terminal, or its browser.
+    fn pane_focus(&self, pane: &str, cx: &App) -> Option<FocusHandle> {
+        self.pane_term(pane).map(|t| t.focus.clone()).or_else(|| self.browsers.get(pane).map(|b| b.read(cx).focus_handle(cx)))
     }
 
     fn load(&self, inst: Instance, window: &mut Window, cx: &mut Context<Self>) -> Copy {
@@ -2880,7 +2881,7 @@ impl AppWindow {
                     let id = block.id.clone();
                     self.focused_pane = Some(id.clone());
                     self.synced_model_pane = self.model.focused_pane();
-                    if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id) {
+                    if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id, cx) {
                         f.focus(window, cx);
                     }
                     self.publish(cx);
@@ -2919,6 +2920,10 @@ impl AppWindow {
                 let r = place::Place::parse(Self::arg(a, "place"))
                     .and_then(|p| self.require_document(crate::browser::find::split(agent.trim()).0).map(|_| p))
                     .and_then(|p| place::show(&mut self.model, agent, p, Self::owned(a, "pane")));
+                if r.is_ok() {
+                    // Forces the next sync to hand the keyboard to the pane, new or existing.
+                    self.focused_pane = None;
+                }
                 self.answer(r);
             }
             // ---- terminals
@@ -3969,7 +3974,7 @@ impl AppWindow {
                             let dialog = this.overlays.iter().any(|o| o.kind.modal_keys());
                             if !dialog
                                 && (window.focused(cx).is_none() || this.focus.is_focused(window))
-                                && let Some(f) = this.focused_pane.as_ref().and_then(|p| this.pane_focus(p))
+                                && let Some(f) = this.focused_pane.as_ref().and_then(|p| this.pane_focus(p, cx))
                                 && !f.is_focused(window)
                             {
                                 f.focus(window, cx);

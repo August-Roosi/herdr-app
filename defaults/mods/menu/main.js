@@ -32,10 +32,20 @@ function items(p, git) {
       const parent = term?.parent && all.find((t) => t.address === term.parent);
       // Once they go to the program, Shift+right-click still opens this menu.
       const toProgram = term?.labels?.["herdr.right-click"] === "program";
+      // A browser the agent started: labelled with its bare id, on its machine.
+      const at = (a) => a.lastIndexOf("/") + 1;
+      const hasBrowser =
+        term &&
+        all.some(
+          (t) =>
+            t.labels?.["browser-for"] === term.address.slice(at(term.address)) &&
+            t.address.slice(0, at(t.address)) === term.address.slice(0, at(term.address)),
+        );
       return [
         ["Split right", "pane.split", { direction: "right", pane: tg.pane }],
         ["Split down", "pane.split", { direction: "down", pane: tg.pane }],
         ["Zoom", "pane.zoom", { pane: tg.pane }],
+        ...(hasBrowser ? [["Show browser", "browser.show", { terminal: term.address }]] : []),
         ...(term
           ? [
               toProgram
