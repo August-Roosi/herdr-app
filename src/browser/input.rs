@@ -42,7 +42,7 @@ pub fn key_event(keystroke: &gpui::Keystroke, down: bool) -> Vec<Value> {
 }
 
 /// The text a keystroke types, if it types any.
-fn text(k: &gpui::Keystroke) -> Option<String> {
+pub fn text(k: &gpui::Keystroke) -> Option<String> {
     let t = match &k.key_char {
         Some(c) => c.clone(),
         None if k.key == "space" => " ".to_string(),

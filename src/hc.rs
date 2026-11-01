@@ -171,6 +171,44 @@ struct Routes {
     streams: HashMap<u32, async_channel::Sender<Stream>>,
     /// Frames for a channel whose attach reply hasn't been handled yet.
     early: HashMap<u32, Vec<Stream>>,
+    /// Channels we detached whose CLOSE hasn't come back yet, oldest first:
+    /// frames still in flight for them are dropped, not kept in `early`.
+    detached: std::collections::VecDeque<u32>,
+}
+
+/// At most this many detached channels are remembered.
+const MAX_DETACHED: usize = 256;
+
+impl Routes {
+    /// Hands a frame to its channel's stream (or keeps it for an attach
+    /// still in flight; drops it for a channel we detached).
+    fn deliver(&mut self, channel: u32, item: Stream) {
+        let closing = matches!(item, Stream::Closed(_));
+        if let Some(tx) = self.streams.get(&channel) {
+            let _ = tx.try_send(item);
+        } else if let Some(i) = self.detached.iter().position(|&c| c == channel) {
+            // Ours is gone; its CLOSE is the last frame (channels aren't reused).
+            if closing {
+                self.detached.remove(i);
+            }
+            return;
+        } else {
+            self.early.entry(channel).or_default().push(item);
+        }
+        if closing {
+            self.streams.remove(&channel);
+        }
+    }
+
+    /// Stops routing `channel`: frames still on the way are dropped.
+    fn detach(&mut self, channel: u32) {
+        self.streams.remove(&channel);
+        self.early.remove(&channel);
+        if self.detached.len() == MAX_DETACHED {
+            self.detached.pop_front();
+        }
+        self.detached.push_back(channel);
+    }
 }
 
 /// The supported core API generation; a generation change requires a matching app update.
@@ -344,16 +382,7 @@ impl Core {
                     CLOSE => Stream::Closed(serde_json::from_slice(&payload).unwrap_or(Value::Null)),
                     _ => continue,
                 };
-                let closing = matches!(item, Stream::Closed(_));
-                match r.streams.get(&channel) {
-                    Some(tx) => {
-                        let _ = tx.try_send(item);
-                    }
-                    None => r.early.entry(channel).or_default().push(item),
-                }
-                if closing {
-                    r.streams.remove(&channel);
-                }
+                r.deliver(channel, item);
             }
             // The core went away: tell every pane, and fail calls still waiting.
             let mut r = routes.lock().unwrap();
@@ -495,7 +524,7 @@ impl Core {
     }
 
     pub fn detach(&self, channel: u32) {
-        self.routes.lock().unwrap().streams.remove(&channel);
+        self.routes.lock().unwrap().detach(channel);
         self.send(channel, CLOSE, &[]);
     }
 }
@@ -510,7 +539,7 @@ impl Drop for Core {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -579,6 +608,33 @@ mod tests {
     }
 
     #[test]
+    fn late_frames_for_a_detached_channel_are_dropped() {
+        let mut r = Routes::default();
+        let (tx, rx) = async_channel::unbounded();
+        r.streams.insert(7, tx);
+        r.deliver(7, Stream::Data(b"live".to_vec()));
+        assert!(matches!(rx.try_recv(), Ok(Stream::Data(d)) if d == b"live"));
+        r.detach(7);
+        r.deliver(7, Stream::Data(b"late".to_vec()));
+        assert!(r.early.is_empty(), "a detached channel's late data is not kept");
+        assert!(rx.try_recv().is_err());
+        r.deliver(7, Stream::Closed(Value::Null));
+        assert!(r.early.is_empty(), "nor its CLOSE");
+        assert!(r.detached.is_empty(), "its CLOSE ends it");
+        // A channel whose open reply is still on the way keeps its frames.
+        r.deliver(8, Stream::Data(b"early".to_vec()));
+        assert_eq!(r.early.get(&8).map(Vec::len), Some(1));
+        // Remembered channels are bounded, and detaching drops what was kept.
+        r.detach(8);
+        assert!(r.early.is_empty());
+        for ch in 100..100 + 2 * MAX_DETACHED as u32 {
+            r.detach(ch);
+        }
+        assert_eq!(r.detached.len(), MAX_DETACHED);
+        assert_eq!(r.detached.back(), Some(&(99 + 2 * MAX_DETACHED as u32)));
+    }
+
+    #[test]
     fn calls_after_disconnect_fail_without_waiting_for_a_reply() {
         let (writer, _frames) = mpsc::channel();
         let (_lost_tx, lost) = async_channel::bounded(1);
@@ -613,13 +669,13 @@ mod tests {
 
     /// An isolated core (own HC_SESSION and XDG dirs under /var/tmp), from the
     /// fork binary in `HERDR_CORE_BIN` (default `../herdr-core/target/debug/herdr-core`).
-    struct Isolated {
+    pub(crate) struct Isolated {
         root: std::path::PathBuf,
         bin: std::path::PathBuf,
     }
 
     impl Isolated {
-        fn new(name: &str) -> Isolated {
+        pub(crate) fn new(name: &str) -> Isolated {
             let root = std::path::PathBuf::from(format!("/var/tmp/herdr-app-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             for dir in ["run", "state", "config"] {
@@ -630,6 +686,11 @@ mod tests {
                 .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../herdr-core/target/debug/herdr-core"));
             assert!(bin.exists(), "no core binary at {bin:?}: build the fork or set HERDR_CORE_BIN");
             Isolated { root, bin }
+        }
+
+        /// A connection to this core.
+        pub(crate) fn connect(&self) -> Arc<Core> {
+            Core::connect_with(self.command()).unwrap()
         }
 
         fn command(&self) -> std::process::Command {
