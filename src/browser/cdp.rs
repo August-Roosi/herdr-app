@@ -190,6 +190,11 @@ impl Cdp {
     pub fn events(&self) -> async_channel::Receiver<Event> {
         self.events.clone()
     }
+
+    /// True once the connection ended (calls fail from then on).
+    pub fn is_closed(&self) -> bool {
+        self.inner.pending.lock().unwrap().is_none()
+    }
 }
 
 impl Drop for Cdp {
@@ -355,10 +360,11 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
+    use super::super::testutil::{Chromium, TcpTransport};
     use super::*;
     use serde_json::json;
     use std::io::{Read as _, Write as _};
-    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
     fn t(id: &str, kind: &str, seq: u64) -> TargetInfo {
@@ -404,53 +410,6 @@ mod tests {
         assert!(ts.apply("Target.targetDestroyed", &json!({"targetId": "a"})));
         assert_eq!(pick_target(&ts.list, None).as_deref(), Some("b"));
         assert!(!ts.apply("Page.frameNavigated", &json!({})));
-    }
-
-    /// Test transport over a plain TCP socket.
-    struct TcpTransport {
-        stream: TcpStream,
-        rx: async_channel::Receiver<Stream>,
-    }
-
-    impl TcpTransport {
-        fn connect(port: u16) -> TcpTransport {
-            let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            Self::new(stream)
-        }
-
-        fn new(stream: TcpStream) -> TcpTransport {
-            let (tx, rx) = async_channel::unbounded();
-            let mut r = stream.try_clone().unwrap();
-            std::thread::spawn(move || {
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    match r.read(&mut buf) {
-                        Ok(0) | Err(_) => {
-                            let _ = tx.send_blocking(Stream::Closed(Value::Null));
-                            return;
-                        }
-                        Ok(n) => {
-                            if tx.send_blocking(Stream::Data(buf[..n].to_vec())).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-            TcpTransport { stream, rx }
-        }
-    }
-
-    impl Transport for TcpTransport {
-        fn send(&self, bytes: &[u8]) {
-            let _ = (&self.stream).write_all(bytes);
-        }
-        fn recv(&self) -> async_channel::Receiver<Stream> {
-            self.rx.clone()
-        }
-        fn close(&self) {
-            let _ = self.stream.shutdown(Shutdown::Both);
-        }
     }
 
     /// Fake browser endpoint: a raw server socket and its client transport.
@@ -610,53 +569,6 @@ mod tests {
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(&k).unwrap().len(), 16);
         assert_ne!(handshake_key(), k);
         assert_ne!(next_mask(), next_mask());
-    }
-
-    /// A headless Chromium on a free loopback port, killed (whole process
-    /// group) and its profile removed on drop.
-    struct Chromium {
-        child: std::process::Child,
-        dir: std::path::PathBuf,
-        port: u16,
-    }
-
-    impl Chromium {
-        fn start(bin: &str) -> Chromium {
-            use std::os::unix::process::CommandExt as _;
-            let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-            let dir = std::path::PathBuf::from(format!("/var/tmp/herdr-cdp-test-{}-{port}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let child = std::process::Command::new(bin)
-                .args([
-                    "--headless=new",
-                    "--remote-debugging-address=127.0.0.1",
-                    &format!("--remote-debugging-port={port}"),
-                    "--no-sandbox",
-                    &format!("--user-data-dir={}", dir.display()),
-                    "--window-size=1280,800",
-                    "about:blank",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let me = Chromium { child, dir, port };
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while TcpStream::connect(("127.0.0.1", port)).is_err() {
-                assert!(Instant::now() < deadline, "chromium did not open port {port}");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            me
-        }
-    }
-
-    impl Drop for Chromium {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("kill").args(["-KILL", "--", &format!("-{}", self.child.id())]).status();
-            let _ = self.child.wait();
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
     }
 
     fn recv_until(events: &async_channel::Receiver<Event>, secs: u64, mut want: impl FnMut(&Event) -> bool) -> Event {

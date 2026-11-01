@@ -24,7 +24,7 @@ gpui-base = { path = "vendor/gpui-kit/crates/base" }
 anyhow = "1"
 async-channel = "2"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp", "jpeg"] }
 png = "0.17"
 ttf-parser = "0.25"
 smallvec = "1"
