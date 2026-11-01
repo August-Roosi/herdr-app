@@ -4,6 +4,7 @@
 //! terminal is a mod. Commands (commands.rs) are the one way to change
 //! anything: keys, mods, menus and agents all run them.
 
+use crate::browser::{place, view::BrowserView};
 use crate::hc::Core;
 mod floats;
 mod movable;
@@ -374,6 +375,8 @@ pub struct AppWindow {
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
+    /// Browser panes by block id, only while shown (each one screencasts).
+    browsers: HashMap<String, Entity<BrowserView>>,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
@@ -474,6 +477,7 @@ impl AppWindow {
             model: Model::default(),
             terms: HashMap::new(),
             copies: HashMap::new(),
+            browsers: HashMap::new(),
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
@@ -797,6 +801,9 @@ impl AppWindow {
         self.publish(cx);
         for t in self.terms.values() {
             t.view.update(cx, |v, cx| v.reattach(core.clone(), cx));
+        }
+        for b in self.browsers.values() {
+            b.update(cx, |v, cx| v.start(core.clone(), cx));
         }
         cx.notify();
     }
@@ -1406,6 +1413,17 @@ impl AppWindow {
         for id in gone {
             if let Some(t) = self.terms.remove(&id) {
                 t.view.read(cx).detach();
+            }
+        }
+
+        // Browser panes connect while shown and let go when hidden.
+        let tab = self.shows_tab().then(|| self.model.active_tab().map(Tab::shown)).flatten();
+        let want: HashMap<String, String> = place::visible(&self.chrome, tab).into_iter().collect();
+        self.browsers.retain(|id, b| want.get(id).is_some_and(|a| *a == b.read(cx).agent));
+        for (id, agent) in want {
+            if !self.browsers.contains_key(&id) {
+                let core = self.core.clone();
+                self.browsers.insert(id, cx.new(|cx| BrowserView::new(core, agent, cx)));
             }
         }
 
@@ -2896,6 +2914,13 @@ impl AppWindow {
                     }
                 }
             }
+            "browser.show" => {
+                let agent = Self::arg(a, "terminal").unwrap_or_default();
+                let r = place::Place::parse(Self::arg(a, "place"))
+                    .and_then(|p| self.require_document(crate::browser::find::split(agent.trim()).0).map(|_| p))
+                    .and_then(|p| place::show(&mut self.model, agent, p, Self::owned(a, "pane")));
+                self.answer(r);
+            }
             // ---- terminals
             "terminal.open" => {
                 let argv = Self::argv(a);
@@ -3863,6 +3888,26 @@ impl AppWindow {
                 None => div().into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
+            Content::Browser { .. } => match self.browsers.get(&n.id) {
+                Some(b) => {
+                    let id = n.id.clone();
+                    div()
+                        .size_full()
+                        // Capture: the page's own right-click stops the bubble.
+                        .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                            if this.focused_pane.as_deref() != Some(id.as_str()) && this.model.tab_of(&id).is_some() {
+                                this.model.focus_pane(&id);
+                                this.focused_pane = Some(id.clone());
+                                this.publish(cx);
+                                this.save();
+                                cx.notify();
+                            }
+                        }))
+                        .child(b.clone())
+                        .into_any_element()
+                }
+                None => div().into_any_element(),
+            },
             Content::Agent { .. } => match self.shown_agent() {
                 Some(addr) => match self.agent_view(&n.id, &addr) {
                     Some(t) => div().size_full().child(shown_terminal(&t.view, cx)).into_any_element(),
@@ -4354,6 +4399,7 @@ fn needs_model_pane(name: &str, args: &Value) -> bool {
         "pane.split" | "pane.close" | "pane.zoom" | "terminal.show" => AppWindow::arg(args, "pane").is_none(),
         "pane.go" | "pane.swap" => true,
         "terminal.open" | "terminal.keep" => matches!(AppWindow::arg(args, "place"), Some("right" | "down")),
+        "browser.show" => AppWindow::arg(args, "pane").is_none() && AppWindow::arg(args, "place") != Some("tab"),
         _ => false,
     }
 }

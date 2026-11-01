@@ -52,6 +52,14 @@ impl CoreTransport {
     }
 }
 
+impl Drop for CoreTransport {
+    fn drop(&mut self) {
+        // A connect given up (cancelled, timed out) never handed it on: its
+        // channel, route and forwarding thread end here.
+        self.close();
+    }
+}
+
 impl Transport for CoreTransport {
     fn send(&self, bytes: &[u8]) {
         self.core.write(self.channel, bytes);
@@ -182,7 +190,8 @@ impl Cdp {
         }
     }
 
-    /// `call` for threads without an executor (tests, setup code).
+    /// `call` for threads without an executor (tests).
+    #[cfg(test)]
     pub fn call_blocking(&self, method: &str, params: Value, session: Option<&str>) -> Result<Value> {
         block_on(self.call(method, params, session))
     }
@@ -338,7 +347,37 @@ pub fn pick_target(targets: &[TargetInfo], pinned: Option<&str>) -> Option<Strin
     targets.iter().filter(|t| t.kind == "page").max_by_key(|t| t.seq).map(|t| t.id.clone())
 }
 
-/// Drives a future to its end on this thread.
+/// `f`, or an error once `limit` passed without it finishing (`f` is then
+/// dropped). Needs no executor: a timer thread wakes it, and ends early once
+/// `f` finished.
+pub async fn within<T>(limit: std::time::Duration, what: &str, f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::task::Poll;
+    let (done, finished) = channel::<()>();
+    let (tx, late) = async_channel::bounded::<()>(1);
+    std::thread::spawn(move || {
+        if finished.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
+            let _ = tx.try_send(());
+        }
+    });
+    let mut f = std::pin::pin!(f);
+    let mut late = std::pin::pin!(late.recv());
+    let out = std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = f.as_mut().poll(cx) {
+            return Poll::Ready(v);
+        }
+        match late.as_mut().poll(cx) {
+            Poll::Ready(_) => Poll::Ready(Err(anyhow!("{what}: no answer in {limit:?}"))),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await;
+    drop(done);
+    out
+}
+
+/// Drives a future to its end on this thread (tests).
+#[cfg(test)]
 pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
     use std::task::{Context, Poll, Wake, Waker};
     struct Unpark(std::thread::Thread);
@@ -410,6 +449,44 @@ mod tests {
         assert!(ts.apply("Target.targetDestroyed", &json!({"targetId": "a"})));
         assert_eq!(pick_target(&ts.list, None).as_deref(), Some("b"));
         assert!(!ts.apply("Page.frameNavigated", &json!({})));
+    }
+
+    /// A channel through a real (fork) core whose peer is a plain listener.
+    /// Returns the core, the transport and the peer's side of the socket.
+    fn core_channel(iso: &crate::hc::tests::Isolated) -> (Arc<Core>, CoreTransport, TcpStream) {
+        let core = iso.connect();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let opened = core.open_socket(&addr, None).unwrap();
+        let (peer, _) = l.accept().unwrap();
+        (core.clone(), CoreTransport::new(core, opened), peer)
+    }
+
+    /// True once the peer reads end of stream (within 5 s).
+    fn peer_sees_eof(mut peer: TcpStream) -> bool {
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 64];
+        matches!(peer.read(&mut buf), Ok(0))
+    }
+
+    #[test]
+    fn dropping_a_core_transport_closes_its_channel() {
+        let iso = crate::hc::tests::Isolated::new("transport-drop");
+        let (_core, transport, peer) = core_channel(&iso);
+        // e.g. a connect cancelled before it handed the transport on
+        drop(transport);
+        assert!(peer_sees_eof(peer), "the core kept the socket open");
+    }
+
+    #[test]
+    fn closing_then_dropping_a_core_transport_detaches_once() {
+        let iso = crate::hc::tests::Isolated::new("transport-close");
+        let (core, transport, peer) = core_channel(&iso);
+        transport.close();
+        drop(transport);
+        assert!(peer_sees_eof(peer));
+        // the core connection is still fine
+        assert!(core.call("terminal.list", json!({})).is_ok());
     }
 
     /// Fake browser endpoint: a raw server socket and its client transport.

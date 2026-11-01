@@ -172,6 +172,16 @@ End a terminal and its sub-agents.
 |---|---|
 | `terminal` | yes |
 
+## `browser.show`
+
+Show an agent's browser (its herdr-browser Chromium) in a pane: "right" (default), "down", or "tab".
+
+| Argument | Required |
+|---|---|
+| `terminal` | yes |
+| `place` | no |
+| `pane` | no |
+
 ## `space.select`
 
 Show a space (by position or id).

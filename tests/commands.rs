@@ -17,6 +17,8 @@ fn commands_need_no_window_or_app_home() {
     let commands = commands.as_array().unwrap();
     assert!(!commands.is_empty());
     assert!(commands.iter().any(|c| c["name"] == "pane.split"));
+    let browser = commands.iter().find(|c| c["name"] == "browser.show").expect("browser.show is listed");
+    assert_eq!(browser["args"], serde_json::json!([{"name":"terminal","required":true},{"name":"place","required":false},{"name":"pane","required":false}]));
     for command in commands {
         assert!(command["name"].is_string());
         assert!(command["about"].is_string());

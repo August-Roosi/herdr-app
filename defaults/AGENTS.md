@@ -162,6 +162,27 @@ the highlighted line shows where it will land.
   `setAgentOrder(list.map(a => a.address))` on render so `agent.next` /
   `agent.prev` follow its list.
 
+## Browser pane
+
+A browser pane shows an agent's browser, live: the Chromium that
+`herdr-browser mcp` starts for the agent the first time it browses. The
+person sees the page and can click, scroll, type and switch its tabs; the
+agent keeps driving it. The pane finds the browser through its terminal's
+labels (`browser-for=<agent id>`, `cdp=127.0.0.1:<port>`), on the agent's
+machine, and reconnects when it restarts. Until the agent browses it says
+"no browser yet".
+
+- `browser.show {terminal: "t3"}` splits it right of the focused pane
+  (`place: "down"`, or `"tab"` for a new tab in the agent's space; `pane`
+  splits beside another pane). Another machine's agent: `rohan/t3`; its
+  pane goes in a space on that machine. Showing one already shown focuses it.
+- `terminal: "base"` (`rohan/base`) is the login browser: log in there once
+  and agents' browsers start with those cookies.
+- It is a pane like a mod pane: it splits, zooms, closes and is saved with
+  its tab, but has no terminal, so closing it ends nothing. Layouts can
+  place one too: `{ "type": "block", "content": { "browser": "base" } }`.
+  It connects only while shown.
+
 ## Layouts: `layouts/<name>.json`
 
 Each file is one whole window. `layout.switch` (`ctrl-shift-l`) cycles
@@ -561,6 +582,8 @@ The main ones:
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
 - Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`.
+- Browser: `browser.show {terminal, place?, pane?}` (an agent's browser in a pane;
+  see "Browser pane").
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),

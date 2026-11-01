@@ -28,6 +28,9 @@ pub enum Content {
     },
     /// An agent's terminal, full size (`"focused"`: the selected agent).
     Agent { agent: String },
+    /// An agent's browser (its herdr-browser Chromium, `browser-for` label):
+    /// `t3`, `rohan/t3`, or `base` for the login browser. Not a terminal.
+    Browser { browser: String },
 }
 
 /// Which side of its node a floating block sits on. Left/right make it
@@ -465,9 +468,9 @@ impl Node {
         }
     }
 
-    /// A pane in a tab: a terminal, or a mod beside them (a viewer, a board).
+    /// A pane in a tab: a terminal, or a mod or browser beside them (a viewer, a board).
     pub fn is_pane(&self) -> bool {
-        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. }))
+        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. } | Content::Browser { .. }))
     }
 
     pub fn closable(&self) -> bool {
@@ -747,6 +750,18 @@ mod tests {
         assert_eq!((n.floating[0].edge, n.floating[0].align), (Edge::Left, Align::Center));
         let back: Node = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
         assert_eq!(back, n);
+    }
+
+    #[test]
+    fn browser_block_roundtrips() {
+        let json = serde_json::json!({ "id": "b", "type": "block", "content": { "browser": "rohan/t3" } });
+        let n: Node = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(n.content(), Some(&Content::Browser { browser: "rohan/t3".into() }));
+        assert_eq!(serde_json::to_value(&n).unwrap(), json);
+        // A pane, but no terminal: nothing to park, keep or kill.
+        assert!(n.is_pane());
+        assert_eq!(n.terminal(), None);
+        assert!(n.terminals().is_empty());
     }
 
     fn term(id: &str) -> Node {

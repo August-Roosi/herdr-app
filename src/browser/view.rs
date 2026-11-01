@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub const BAR: f32 = 28.0;
 const STATUS: f32 = 18.0;
 const RETRY: Duration = Duration::from_secs(1);
+const SETUP: Duration = Duration::from_secs(10);
 /// The screencast's size until the pane has been laid out (device px).
 const FIRST_PX: (u32, u32) = (1280, 800);
 /// What the local core is called in messages.
@@ -109,6 +110,12 @@ async fn attempt(core: &Arc<Core>, agent: &str, px: (u32, u32)) -> Attempt {
 }
 
 async fn connect(core: &Arc<Core>, found: &Found, px: (u32, u32)) -> Attempt {
+    connect_within(core, found, px, SETUP).await
+}
+
+/// Reaches the browser's debugging port; each step that waits on the
+/// browser fails after `limit` (a port that accepts but never answers).
+async fn connect_within(core: &Arc<Core>, found: &Found, px: (u32, u32), limit: Duration) -> Attempt {
     let on = found.machine.as_deref();
     let machine = on.unwrap_or(HERE).to_owned();
     let has_socket = core.hello["methods"].as_array().is_none_or(|ms| ms.iter().any(|m| m == "socket.open"));
@@ -125,7 +132,7 @@ async fn connect(core: &Arc<Core>, found: &Found, px: (u32, u32)) -> Attempt {
         Ok(t) => t,
         Err(a) => return a,
     };
-    let path = match cdp::discover(http, found.port).await {
+    let path = match cdp::within(limit, "/json/version", cdp::discover(http, found.port)).await {
         Ok(path) => path,
         Err(e) => return Attempt::Failed(e),
     };
@@ -133,7 +140,7 @@ async fn connect(core: &Arc<Core>, found: &Found, px: (u32, u32)) -> Attempt {
         Ok(t) => t,
         Err(a) => return a,
     };
-    match Cdp::connect(ws, &path, found.port).await {
+    match cdp::within(limit, "websocket upgrade", Cdp::connect(ws, &path, found.port)).await {
         Ok(cdp) => Attempt::Source(CdpScreencast::start(cdp, px)),
         Err(e) => Attempt::Failed(e),
     }
@@ -330,10 +337,6 @@ impl BrowserView {
         if let Some(source) = &self.shared.borrow().source {
             source.select(target);
         }
-    }
-
-    pub fn focus_handle(&self) -> &FocusHandle {
-        &self.focus
     }
 
     /// Frames shown in the last second.
@@ -600,7 +603,10 @@ impl Render for BrowserView {
                     .on_mouse_up(MouseButton::Left, cx.listener(|view, ev: &MouseUpEvent, _, _| view.mouse(MouseKind::Up, Some(ev.button), ev.position, ev.click_count)))
                     .on_mouse_up(MouseButton::Middle, cx.listener(|view, ev: &MouseUpEvent, _, _| view.mouse(MouseKind::Up, Some(ev.button), ev.position, ev.click_count)))
                     .on_mouse_up(MouseButton::Right, cx.listener(|view, ev: &MouseUpEvent, _, _| view.mouse(MouseKind::Up, Some(ev.button), ev.position, ev.click_count)))
+                    // Released outside the page (over the bar, another pane): the page lets go too.
                     .on_mouse_up_out(MouseButton::Left, cx.listener(|view, ev: &MouseUpEvent, _, _| view.mouse(MouseKind::Up, Some(ev.button), ev.position, ev.click_count)))
+                    .on_mouse_up_out(MouseButton::Middle, cx.listener(|view, ev: &MouseUpEvent, _, _| view.mouse(MouseKind::Up, Some(ev.button), ev.position, ev.click_count)))
+                    .on_mouse_up_out(MouseButton::Right, cx.listener(|view, ev: &MouseUpEvent, _, _| view.mouse(MouseKind::Up, Some(ev.button), ev.position, ev.click_count)))
                     .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, _| view.mouse(MouseKind::Move, ev.pressed_button, ev.position, 0)))
                     .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, _, cx| {
                         cx.stop_propagation();
@@ -813,6 +819,82 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| handle.update(cx, |view, _, _| assert_eq!(view.state, State::Reconnecting)).unwrap());
         assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("stop"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn right_and_middle_releases_outside_the_page_reach_it() {
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(()),
+            gpui_platform::current_headless_renderer,
+        );
+        let (tx, rx) = async_channel::unbounded();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        tx.try_send(SourceEvent::Frame(solid(1280, 800, [0, 0, 255, 255]))).unwrap();
+        let fake = Fake { rx, calls: calls.clone() };
+        let handle = cx
+            .open_window(size(px(1000.), px(1000.)), |_, cx| cx.new(|cx| BrowserView::with_source("t1".into(), Box::new(fake), cx)))
+            .unwrap();
+        cx.run_until_parked();
+        for button in [MouseButton::Right, MouseButton::Middle, MouseButton::Left] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+                let (on_page, on_bar) = (point(px(500.0), px(505.0)), point(px(500.0), px(5.0)));
+                let modifiers = Modifiers::default();
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: on_page, pressed_button: None, modifiers }), cx);
+                window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { button, position: on_page, modifiers, click_count: 1, first_mouse: false }), cx);
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: on_bar, pressed_button: Some(button), modifiers }), cx);
+                // released over the top bar: outside the page
+                window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { button, position: on_bar, modifiers, click_count: 1 }), cx);
+            })
+            .unwrap();
+            let want = format!("{:?}", page_button(Some(button)));
+            let all = calls.lock().unwrap().clone();
+            let ups = all.iter().filter(|c| c.contains("kind: Up") && c.contains(&format!("button: {want}"))).count();
+            assert_eq!(ups, 1, "{button:?} release outside the page: {all:?}");
+        }
+    }
+
+    #[test]
+    fn setup_gives_up_on_a_port_that_never_answers() {
+        let iso = crate::hc::tests::Isolated::new("browser-mute");
+        let core = iso.connect();
+        // accepts, never answers
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((s, _)) = l.accept() {
+                let _ = peer_tx.send(s);
+            }
+        });
+        let found = Found { machine: None, port, terminal: "t9".into() };
+        let start = Instant::now();
+        let tried = cdp::block_on(connect_within(&core, &found, (800, 600), Duration::from_millis(300)));
+        let Attempt::Failed(e) = tried else { panic!("a mute port must fail the attempt") };
+        assert!(e.to_string().contains("no answer"), "{e:#}");
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        // the abandoned channel is closed, not leaked
+        let mut peer = peer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 256];
+        let mut n = std::io::Read::read(&mut peer, &mut buf).unwrap();
+        // the HTTP request came first
+        if n > 0 {
+            n = std::io::Read::read(&mut peer, &mut buf).unwrap();
+        }
+        assert_eq!(n, 0, "the core kept the socket open");
+        assert_eq!(SETUP, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn within_lets_a_ready_future_through() {
+        let ok = cdp::block_on(cdp::within(Duration::from_secs(5), "x", async { Ok(7) }));
+        assert_eq!(ok.unwrap(), 7);
+        let late = cdp::block_on(cdp::within(Duration::from_millis(50), "the thing", std::future::pending::<anyhow::Result<()>>()));
+        assert_eq!(late.unwrap_err().to_string(), "the thing: no answer in 50ms");
     }
 
     #[test]

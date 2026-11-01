@@ -50,6 +50,15 @@ configured PATH. Other shells keep the sh launcher.
 `terminal.open --folder /path --place down` starts the split in that folder,
 including when `--argv` supplies a program. Without `--folder`, it follows the
 focused terminal's folder.
+To show the person an agent's browser (the Chromium `herdr-browser mcp`
+started for it) beside the focused pane, or `base` to log in once for all
+agents:
+
+```sh
+herdr-app do browser.show --terminal t7            # --place down | tab, --pane p12
+herdr-app do browser.show --terminal base
+```
+
 `hc machine ls` lists machines. Use `hc run --on vps ...`, `hc exec --on vps ...`
 and `hc file ... --on vps ...` for remote work, not your local file tools.
 

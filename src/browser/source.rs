@@ -85,6 +85,8 @@ enum Cmd {
 pub struct CdpScreencast {
     cmds: async_channel::Sender<Cmd>,
     frames: async_channel::Receiver<SourceEvent>,
+    // Kept for the tests' throughput checks; nothing in the app reads it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     stats: Arc<Stats>,
 }
 
@@ -156,11 +158,13 @@ impl CdpScreencast {
     }
 
     /// The most calls the worker had in flight at once.
+    #[cfg(test)]
     pub fn max_in_flight(&self) -> u64 {
         self.stats.flights.load(Ordering::Relaxed)
     }
 
     /// Frames decoded so far and the total time spent decoding them.
+    #[cfg(test)]
     pub fn decode_stats(&self) -> (u64, Duration) {
         (self.stats.frames.load(Ordering::Relaxed), Duration::from_micros(self.stats.micros.load(Ordering::Relaxed)))
     }

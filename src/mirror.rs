@@ -70,6 +70,8 @@ fn map_node(node: &mut Node, map: &impl Fn(&str) -> String) {
     node.id = map(&node.id);
     match &mut node.kind {
         Kind::Block { content: Content::Terminal { terminal } } => *terminal = map(terminal),
+        // An agent address too: its space is on the agent's machine (browser::place).
+        Kind::Block { content: Content::Browser { browser } } => *browser = map(browser),
         Kind::Stack { active: Some(active), .. } => *active = map(active),
         _ => {}
     }
@@ -250,6 +252,16 @@ mod tests {
         assert_eq!(doc, Document::capture(&m, Some("mac")));
         assert!(m.space("s").is_some());
         assert!(m.space("mac/s").is_some());
+    }
+    #[test]
+    fn a_browser_pane_names_its_agent_like_a_terminal() {
+        let mut m = model();
+        m.split_with("p", Axis::Row, Node::block("b", Content::Browser { browser: "t1".into() }));
+        let doc = Document::capture(&m, None);
+        doc.replace(&mut m, Some("mac"));
+        let pane = m.tab("mac/t").unwrap().root.find("mac/b").cloned().unwrap();
+        assert_eq!(pane.content(), Some(&Content::Browser { browser: "mac/t1".into() }));
+        assert_eq!(doc, Document::capture(&m, Some("mac")));
     }
     #[test]
     fn replacement_preserves_valid_view_and_falls_back_when_deleted() {
