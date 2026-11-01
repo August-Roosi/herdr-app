@@ -399,10 +399,10 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::{Chromium, TcpTransport};
+    use super::super::testutil::{Chromium, TcpTransport, read_client_frame, read_head, server_text};
     use super::*;
     use serde_json::json;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
@@ -468,7 +468,7 @@ mod tests {
     fn peer_sees_eof(mut peer: TcpStream) -> bool {
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut buf = [0u8; 64];
-        matches!(peer.read(&mut buf), Ok(0))
+        matches!(std::io::Read::read(&mut peer, &mut buf), Ok(0))
     }
 
     #[cfg(unix)]
@@ -501,57 +501,6 @@ mod tests {
         let (server, _) = l.accept().unwrap();
         server.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         (client, server)
-    }
-
-    fn read_head(s: &mut TcpStream) -> String {
-        let mut got = Vec::new();
-        let mut b = [0u8; 1];
-        while !got.ends_with(b"\r\n\r\n") {
-            s.read_exact(&mut b).unwrap();
-            got.push(b[0]);
-        }
-        String::from_utf8(got).unwrap()
-    }
-
-    fn server_text(s: &str) -> Vec<u8> {
-        let mut f = vec![0x81u8];
-        let n = s.len();
-        if n < 126 {
-            f.push(n as u8);
-        } else {
-            f.push(126);
-            f.extend((n as u16).to_be_bytes());
-        }
-        f.extend(s.as_bytes());
-        f
-    }
-
-    /// Reads one masked client frame: `(first byte, payload)`.
-    fn read_client_frame(s: &mut TcpStream) -> (u8, Vec<u8>) {
-        let mut h = [0u8; 2];
-        s.read_exact(&mut h).unwrap();
-        assert!(h[1] & 0x80 != 0, "client frames are masked");
-        let len = match h[1] & 0x7f {
-            126 => {
-                let mut l = [0u8; 2];
-                s.read_exact(&mut l).unwrap();
-                u16::from_be_bytes(l) as usize
-            }
-            127 => {
-                let mut l = [0u8; 8];
-                s.read_exact(&mut l).unwrap();
-                u64::from_be_bytes(l) as usize
-            }
-            n => n as usize,
-        };
-        let mut m = [0u8; 4];
-        s.read_exact(&mut m).unwrap();
-        let mut p = vec![0u8; len];
-        s.read_exact(&mut p).unwrap();
-        for (i, b) in p.iter_mut().enumerate() {
-            *b ^= m[i % 4];
-        }
-        (h[0], p)
     }
 
     #[test]

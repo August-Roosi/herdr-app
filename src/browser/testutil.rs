@@ -3,9 +3,10 @@
 
 use super::cdp::{Cdp, Transport, block_on, discover};
 use crate::hc::Stream;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Test transport over a plain TCP socket.
@@ -147,4 +148,133 @@ pub fn chromium_bin() -> Option<String> {
         eprintln!("HERDR_TEST_CHROMIUM not set; skipping");
     }
     bin
+}
+
+/// Reads an HTTP request's head (up to the blank line).
+pub fn read_head(s: &mut TcpStream) -> String {
+    let mut got = Vec::new();
+    let mut b = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        s.read_exact(&mut b).unwrap();
+        got.push(b[0]);
+    }
+    String::from_utf8(got).unwrap()
+}
+
+/// A server's (unmasked) text frame.
+pub fn server_text(s: &str) -> Vec<u8> {
+    let mut f = vec![0x81u8];
+    let n = s.len();
+    if n < 126 {
+        f.push(n as u8);
+    } else {
+        f.push(126);
+        f.extend((n as u16).to_be_bytes());
+    }
+    f.extend(s.as_bytes());
+    f
+}
+
+/// Reads one masked client frame: `(first byte, payload)`.
+pub fn read_client_frame(s: &mut TcpStream) -> (u8, Vec<u8>) {
+    try_read_client_frame(s).unwrap()
+}
+
+/// `read_client_frame`, failing when the stream ends.
+pub fn try_read_client_frame(s: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut h = [0u8; 2];
+    s.read_exact(&mut h)?;
+    assert!(h[1] & 0x80 != 0, "client frames are masked");
+    let len = match h[1] & 0x7f {
+        126 => {
+            let mut l = [0u8; 2];
+            s.read_exact(&mut l)?;
+            u16::from_be_bytes(l) as usize
+        }
+        127 => {
+            let mut l = [0u8; 8];
+            s.read_exact(&mut l)?;
+            u64::from_be_bytes(l) as usize
+        }
+        n => n as usize,
+    };
+    let mut m = [0u8; 4];
+    s.read_exact(&mut m)?;
+    let mut p = vec![0u8; len];
+    s.read_exact(&mut p)?;
+    for (i, b) in p.iter_mut().enumerate() {
+        *b ^= m[i % 4];
+    }
+    Ok((h[0], p))
+}
+
+/// A browser-level CDP endpoint without a browser: one page (`P1`, session
+/// `S1`), every call answered (the first after `hold`), the methods called
+/// recorded in order.
+pub struct FakeBrowser {
+    pub calls: Arc<Mutex<Vec<String>>>,
+    writer: Arc<Mutex<Option<TcpStream>>>,
+    port: u16,
+}
+
+impl FakeBrowser {
+    pub fn start(hold: Duration) -> FakeBrowser {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (calls, writer) = (Arc::<Mutex<Vec<String>>>::default(), Arc::<Mutex<Option<TcpStream>>>::default());
+        let (seen, out) = (calls.clone(), writer.clone());
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            read_head(&mut s);
+            let mut w = s.try_clone().unwrap();
+            w.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n").unwrap();
+            *out.lock().unwrap() = Some(w);
+            let mut first = true;
+            while let Ok((b0, p)) = try_read_client_frame(&mut s) {
+                match b0 & 0x0f {
+                    1 => {}
+                    8 => return,
+                    _ => continue,
+                }
+                let m: Value = serde_json::from_slice(&p).unwrap();
+                let method = m["method"].as_str().unwrap_or_default().to_owned();
+                seen.lock().unwrap().push(method.clone());
+                if std::mem::take(&mut first) {
+                    std::thread::sleep(hold);
+                }
+                let result = match method.as_str() {
+                    "Target.getTargets" => json!({"targetInfos": [{"targetId": "P1", "type": "page", "url": "about:blank", "title": ""}]}),
+                    "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                    _ => json!({}),
+                };
+                let mut reply = json!({"id": m["id"], "result": result});
+                if let Some(session) = m.get("sessionId") {
+                    reply["sessionId"] = session.clone();
+                }
+                send(&out, &reply);
+            }
+        });
+        FakeBrowser { calls, writer, port }
+    }
+
+    /// A CDP connection to it.
+    pub fn cdp(&self) -> Cdp {
+        block_on(Cdp::connect(TcpTransport::connect(self.port), "/devtools/browser/fake", self.port)).unwrap()
+    }
+
+    /// Sends `msg` (an event) to the client.
+    pub fn send(&self, msg: &Value) {
+        send(&self.writer, msg);
+    }
+
+    /// How often `method` was called.
+    pub fn count(&self, method: &str) -> usize {
+        self.calls.lock().unwrap().iter().filter(|m| *m == method).count()
+    }
+}
+
+fn send(writer: &Mutex<Option<TcpStream>>, msg: &Value) {
+    if let Some(w) = writer.lock().unwrap().as_mut() {
+        let _ = w.write_all(&server_text(&msg.to_string()));
+    }
 }

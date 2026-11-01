@@ -132,7 +132,9 @@ impl CdpScreencast {
                 listed: None,
                 buttons: 0,
                 flights: Vec::new(),
-                held: None,
+                held: std::collections::VecDeque::new(),
+                last_frame: None,
+                last_probe: None,
                 events_first: false,
                 move_pending: None,
                 stats: worker_stats,
@@ -319,8 +321,12 @@ struct Worker {
     /// Mouse buttons held (CDP `buttons` bitmask).
     buttons: u32,
     flights: Vec<Flight>,
-    /// A command taken out of order by `coalesce`, handled next.
-    held: Option<Cmd>,
+    /// Commands taken out of order by `coalesce` or `latest_resize`, handled next.
+    held: std::collections::VecDeque<Cmd>,
+    /// When the shown target's last frame came.
+    last_frame: Option<Instant>,
+    /// When the connection was last checked (see `probe_at`).
+    last_probe: Option<Instant>,
     /// Alternates which of commands and events `next` looks at first.
     events_first: bool,
     /// The latest mouse move, waiting for the one in flight to finish.
@@ -332,6 +338,8 @@ enum Next {
     Event(Event),
     Cmd(Cmd),
     Ack(Ack),
+    /// Time to check a quiet screencast's connection.
+    Probe,
     Stop,
 }
 
@@ -348,10 +356,21 @@ impl Worker {
         loop {
             match self.next(&events, &cmds, &acks)? {
                 Next::Stop => return Ok(()),
-                Next::Cmd(Cmd::Input(i @ PageInput::Mouse { kind: MouseKind::Move, .. })) => {
+                // with commands held, newer ones would jump ahead of them
+                Next::Cmd(Cmd::Input(i @ PageInput::Mouse { kind: MouseKind::Move, .. })) if self.held.is_empty() => {
                     let (c, held) = coalesce(Cmd::Input(i), &cmds);
-                    self.held = held;
+                    self.held.extend(held);
                     self.command(c)?;
+                }
+                Next::Cmd(Cmd::Resize(px)) => {
+                    let Some((px, rest)) = latest_resize(px, &cmds) else { return Ok(()) };
+                    self.held.extend(rest);
+                    self.command(Cmd::Resize(px))?;
+                }
+                Next::Probe => {
+                    // a reply that never comes ends the source (see `next`)
+                    self.last_probe = Some(Instant::now());
+                    self.fire("Target.getTargets", json!({}), None);
                 }
                 Next::Cmd(c) => self.command(c)?,
                 Next::Event(e) => self.event(e)?,
@@ -363,7 +382,7 @@ impl Worker {
     /// Waits for the next ack, command or event (commands and events take
     /// turns), meanwhile finishing calls in flight.
     fn next(&mut self, events: &async_channel::Receiver<Event>, cmds: &async_channel::Receiver<Cmd>, acks: &async_channel::Receiver<Ack>) -> Result<Next, Gone> {
-        if let Some(c) = self.held.take() {
+        if let Some(c) = self.held.pop_front() {
             return Ok(match c {
                 Cmd::Stop => Next::Stop,
                 c => Next::Cmd(c),
@@ -372,6 +391,7 @@ impl Worker {
         self.events_first = !self.events_first;
         let events_first = self.events_first;
         let (flights, move_pending, cdp) = (&mut self.flights, &mut self.move_pending, &self.cdp);
+        let probe = probe_at(self.last_frame, self.last_probe);
         // the earliest deadline of calls still in flight: when to look again
         let wake = std::cell::Cell::new(None);
         let mut e = std::pin::pin!(events.recv());
@@ -398,7 +418,10 @@ impl Worker {
                 if lost {
                     return Poll::Ready(Err(Gone));
                 }
-                wake.set(flights.iter().map(|f| f.deadline).min());
+                if probe.is_some_and(|t| t <= now) {
+                    return Poll::Ready(Ok(Next::Probe));
+                }
+                wake.set(flights.iter().map(|f| f.deadline).chain(probe).min());
                 if !flights.iter().any(|f| f.is_move)
                     && let Some(m) = move_pending.take()
                 {
@@ -528,6 +551,7 @@ impl Worker {
                 }
             }
             "Page.screencastFrame" if ours => {
+                self.last_frame = Some(Instant::now());
                 // the decoder acks a frame when it takes it; one it never
                 // takes (replaced by a newer frame) is acked here
                 if let Some(old) = self.slot.put(Raw { params: e.params.clone(), session: e.session.clone() }) {
@@ -651,6 +675,35 @@ fn coalesce(c: Cmd, cmds: &async_channel::Receiver<Cmd>) -> (Cmd, Option<Cmd>) {
     (latest, None)
 }
 
+/// After a resize, the latest size queued behind it and the other commands
+/// queued, in order; `None` when a stop was queued (it wins: nothing else is
+/// done). Each resize restarts the screencast, a round trip or two: a pane
+/// dragged wider queues one per layout pass.
+fn latest_resize(px: (u32, u32), cmds: &async_channel::Receiver<Cmd>) -> Option<((u32, u32), Vec<Cmd>)> {
+    let (mut px, mut rest) = (px, Vec::new());
+    while let Ok(c) = cmds.try_recv() {
+        match c {
+            Cmd::Resize(p) => px = p,
+            Cmd::Stop => return None,
+            c => rest.push(c),
+        }
+    }
+    Some((px, rest))
+}
+
+/// How long a live screencast may send no frame before the source checks
+/// the connection is still there (a laptop back from sleep: no error, no
+/// frames). A static page sends none either, so at most one check per stall.
+const STALL: Duration = Duration::from_secs(5);
+
+/// When to check a quiet screencast: a stall after the last frame or check;
+/// `None` before the first frame. A check's answer is no frame: it does not
+/// move the next check closer.
+fn probe_at(last_frame: Option<Instant>, last_probe: Option<Instant>) -> Option<Instant> {
+    let frame = last_frame?;
+    Some(last_probe.map_or(frame, |p| p.max(frame)) + STALL)
+}
+
 /// A `Page.screencastFrame`'s JPEG decoded straight to BGRA, with the
 /// page's size in CSS px.
 fn decode(params: &Value) -> Option<Frame> {
@@ -707,7 +760,7 @@ fn block_on_deadline<F: Future>(f: F, deadline: Instant) -> Option<F::Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::{Chromium, PAGE, chromium_bin};
+    use super::super::testutil::{Chromium, FakeBrowser, PAGE, chromium_bin};
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -823,6 +876,91 @@ mod tests {
         let (c, held) = coalesce(Cmd::Select(None), &rx);
         assert!(matches!(c, Cmd::Select(None)) && held.is_none());
         assert_eq!(rx.len(), 1);
+    }
+
+    /// Waits (up to 5 s) for the worker to end: the source's channel closes.
+    fn ends(rx: &async_channel::Receiver<SourceEvent>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Err(async_channel::TryRecvError::Closed) => return,
+                Ok(SourceEvent::Ended) => panic!("the source failed instead of stopping"),
+                _ => {
+                    assert!(Instant::now() < deadline, "the worker did not stop");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queued_resizes_restart_the_screencast_once_and_a_stop_wins() {
+        // the first answer waits, so everything below is queued by then
+        let fake = FakeBrowser::start(Duration::from_millis(300));
+        let source = CdpScreencast::start(fake.cdp(), (800, 600));
+        for i in 0..50 {
+            source.resize((700 + i, 500));
+        }
+        source.stop();
+        ends(&source.frames());
+        let (starts, stops) = (fake.count("Page.startScreencast"), fake.count("Page.stopScreencast"));
+        // the first start, then at most one restart
+        assert!(starts <= 2 && stops <= 1, "{starts} starts, {stops} stops: {:?}", fake.calls.lock().unwrap());
+        assert_eq!(starts, 1, "a queued stop wins over the resizes before it");
+    }
+
+    #[test]
+    fn queued_resizes_keep_the_latest_and_the_others_in_order() {
+        let (tx, rx) = async_channel::unbounded();
+        tx.try_send(Cmd::Resize((2, 2))).unwrap();
+        tx.try_send(mv(1.0)).unwrap();
+        tx.try_send(Cmd::Resize((3, 3))).unwrap();
+        tx.try_send(Cmd::Select(None)).unwrap();
+        let Some((px, rest)) = latest_resize((1, 1), &rx) else { panic!("no stop was queued") };
+        assert_eq!(px, (3, 3));
+        assert!(matches!(rest.as_slice(), [m, Cmd::Select(None)] if x_of(m) == Some(1.0)));
+        assert!(rx.is_empty());
+        tx.try_send(Cmd::Resize((4, 4))).unwrap();
+        tx.try_send(Cmd::Stop).unwrap();
+        tx.try_send(Cmd::Resize((5, 5))).unwrap();
+        assert!(latest_resize((1, 1), &rx).is_none(), "a stop wins");
+    }
+
+    #[test]
+    fn a_quiet_screencast_is_probed_every_stall() {
+        let t0 = Instant::now();
+        assert_eq!(probe_at(None, None), None, "not before the first frame");
+        assert_eq!(probe_at(Some(t0), None), Some(t0 + STALL));
+        // a probe is no frame: the next one comes a stall later, not sooner
+        assert_eq!(probe_at(Some(t0), Some(t0 + STALL)), Some(t0 + 2 * STALL));
+        // a frame after the probe moves it
+        let f = t0 + STALL + Duration::from_secs(2);
+        assert_eq!(probe_at(Some(f), Some(t0 + STALL)), Some(f + STALL));
+        assert_eq!(STALL, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_stalled_screencast_is_probed_and_a_live_one_is_not() {
+        let fake = FakeBrowser::start(Duration::ZERO);
+        let source = CdpScreencast::start(fake.cdp(), (800, 600));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.count("Page.startScreencast") == 0 {
+            assert!(Instant::now() < deadline, "no screencast started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let probes = || fake.count("Target.getTargets") - 1;
+        // no frame yet: nothing to call stalled
+        std::thread::sleep(STALL + Duration::from_millis(500));
+        assert_eq!(probes(), 0);
+        // a frame, then quiet
+        fake.send(&json!({"method": "Page.screencastFrame", "params": {"data": "", "sessionId": 1, "metadata": {}}, "sessionId": "S1"}));
+        std::thread::sleep(STALL - Duration::from_secs(1));
+        assert_eq!(probes(), 0, "probed before a stall");
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(probes(), 1, "{:?}", fake.calls.lock().unwrap());
+        // answered: still alive
+        assert!(!matches!(source.frames().try_recv(), Ok(SourceEvent::Ended)));
+        source.stop();
     }
 
     #[test]
