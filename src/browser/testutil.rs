@@ -97,22 +97,22 @@ impl Chromium {
     }
 
     fn spawn(bin: &str, url: &str, port: u16, dir: &std::path::Path) -> std::process::Child {
-        use std::os::unix::process::CommandExt as _;
-        let child = std::process::Command::new(bin)
-            .args([
-                "--headless=new",
-                "--remote-debugging-address=127.0.0.1",
-                &format!("--remote-debugging-port={port}"),
-                "--no-sandbox",
-                &format!("--user-data-dir={}", dir.display()),
-                "--window-size=1280,800",
-                url,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args([
+            "--headless=new",
+            "--remote-debugging-address=127.0.0.1",
+            &format!("--remote-debugging-port={port}"),
+            "--no-sandbox",
+            &format!("--user-data-dir={}", dir.display()),
+            "--window-size=1280,800",
+            url,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        // its own process group, so `kill` takes its helpers too
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         while TcpStream::connect(("127.0.0.1", port)).is_err() {
             assert!(Instant::now() < deadline, "chromium did not open port {port}");
