@@ -70,6 +70,8 @@ pub struct BrowserView {
     url: String,
     /// The URL bar's text while it is being edited.
     editing: Option<String>,
+    /// An IME's text being composed (not sent yet).
+    marked: Option<String>,
     /// Show the newest page (else the one picked in the tab strip).
     follow: bool,
     /// Whether a frame came since the lookup loop started.
@@ -198,6 +200,7 @@ impl BrowserView {
             shown: None,
             url: String::new(),
             editing: None,
+            marked: None,
             follow: true,
             was_live: false,
             frame_times: VecDeque::new(),
@@ -375,6 +378,17 @@ impl BrowserView {
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.key_down_with(ev, native_text(ev), cx);
+    }
+
+    /// `native`: the OS delivers this key's text through the input handler.
+    fn key_down_with(&mut self, ev: &KeyDownEvent, native: bool, cx: &mut Context<Self>) {
+        // Windows' AltGr, dead keys and IMEs: left to propagate, the text
+        // comes back through `EntityInputHandler` (GPUI also sets the flag on
+        // replayed shortcut prefixes, which `native` rules out).
+        if ev.prefer_character_input && native {
+            return;
+        }
         if self.editing.is_some() {
             self.edit_url(&ev.keystroke, cx);
             cx.stop_propagation();
@@ -385,6 +399,20 @@ impl BrowserView {
             self.send(i);
             cx.stop_propagation();
         }
+    }
+
+    /// Text the OS typed (AltGr, dead keys, IMEs): into the URL bar while it
+    /// is edited, else to the page.
+    fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.marked = None;
+        if text.is_empty() {
+            return;
+        }
+        match self.editing.as_mut() {
+            Some(url) => url.push_str(text),
+            None => self.send(PageInput::Text(text.to_owned())),
+        }
+        cx.notify();
     }
 
     fn key_up(&mut self, ev: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -569,9 +597,63 @@ pub fn fit(area: Bounds<Pixels>, image: (f32, f32)) -> Bounds<Pixels> {
     Bounds::new(point(area.origin.x + px((w - dw) / 2.0), area.origin.y + px((h - dh) / 2.0)), size(px(dw), px(dh)))
 }
 
+#[cfg(windows)]
+fn native_text(ev: &KeyDownEvent) -> bool {
+    gpui_windows::is_native_character_input(ev)
+}
+
+/// Elsewhere text comes with the key (an IME's still reaches the handler).
+#[cfg(not(windows))]
+fn native_text(_: &KeyDownEvent) -> bool {
+    false
+}
+
+/// OS text input (AltGr, dead keys, IMEs) types here, as the terminal's
+/// does: the finished text goes to the page (or the URL bar being edited).
+impl EntityInputHandler for BrowserView {
+    fn text_for_range(&mut self, range: std::ops::Range<usize>, adjusted: &mut Option<std::ops::Range<usize>>, _w: &mut Window, _cx: &mut Context<Self>) -> Option<String> {
+        let units: Vec<u16> = self.marked.as_deref().unwrap_or_default().encode_utf16().collect();
+        let range = range.start.min(units.len())..range.end.min(units.len());
+        *adjusted = Some(range.clone());
+        Some(String::from_utf16_lossy(&units[range]))
+    }
+
+    fn selected_text_range(&mut self, _ignore_disabled: bool, _w: &mut Window, _cx: &mut Context<Self>) -> Option<UTF16Selection> {
+        let len = self.marked.as_ref().map_or(0, |m| m.encode_utf16().count());
+        Some(UTF16Selection { range: len..len, reversed: false })
+    }
+
+    fn marked_text_range(&self, _w: &mut Window, _cx: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+        self.marked.as_ref().filter(|m| !m.is_empty()).map(|m| 0..m.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _w: &mut Window, _cx: &mut Context<Self>) {
+        self.marked = None;
+    }
+
+    fn replace_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, _w: &mut Window, cx: &mut Context<Self>) {
+        self.typed(text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, _selected: Option<std::ops::Range<usize>>, _w: &mut Window, _cx: &mut Context<Self>) {
+        self.marked = (!text.is_empty()).then(|| text.to_owned());
+    }
+
+    fn bounds_for_range(&mut self, _range: std::ops::Range<usize>, element: Bounds<Pixels>, _w: &mut Window, _cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+        // the page's caret is not known here: the IME's window goes to the page's corner
+        Some(Bounds::new(element.origin, size(px(1.0), px(16.0))))
+    }
+
+    fn character_index_for_point(&mut self, _point: Point<Pixels>, _w: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for BrowserView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame = self.frame.clone();
+        // While focused, the OS's text input (AltGr, dead keys, IMEs) types here.
+        let input = self.focus.is_focused(window).then(|| (self.focus.clone(), cx.entity()));
         let (layout_shared, paint_shared) = (self.shared.clone(), self.shared.clone());
         let status = state_text(&self.state).unwrap_or_else(|| format!("{} fps", self.fps()));
         let empty = self.frame.is_none().then(|| status.clone());
@@ -639,7 +721,10 @@ impl Render for BrowserView {
                                     }
                                 }
                             },
-                            move |bounds, _, window, _| {
+                            move |bounds, _, window, cx| {
+                                if let Some((focus, view)) = input {
+                                    window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
+                                }
                                 let mut shared = paint_shared.borrow_mut();
                                 let Some(frame) = &frame else {
                                     shared.rect = None;
@@ -848,6 +933,57 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| handle.update(cx, |view, _, _| assert_eq!(view.state, State::Reconnecting)).unwrap());
         assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("stop"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn os_text_input_reaches_the_page_and_the_url_bar() {
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(()),
+            gpui_platform::current_headless_renderer,
+        );
+        let (_tx, rx) = async_channel::unbounded();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fake = Fake { rx, calls: calls.clone() };
+        let handle = cx
+            .open_window(size(px(1000.), px(1000.)), |_, cx| cx.new(|cx| BrowserView::with_source("t1".into(), Box::new(fake), cx)))
+            .unwrap();
+        cx.run_until_parked();
+        // Windows' AltGr+2 on a German layout: control+alt, typing "@"
+        let mut keystroke = Keystroke::parse("ctrl-alt-2").unwrap();
+        keystroke.key_char = Some("@".into());
+        let altgr = KeyDownEvent { keystroke, is_held: false, prefer_character_input: true };
+        let plain = KeyDownEvent { keystroke: Keystroke::parse("a").unwrap(), is_held: false, prefer_character_input: false };
+        let take = || std::mem::take(&mut *calls.lock().unwrap()).into_iter().filter(|c| !c.starts_with("resize ")).collect::<Vec<_>>();
+        cx.update(|cx| {
+            handle
+                .update(cx, |view, window, cx| {
+                    // the OS types it: the key is left to the input handler
+                    view.key_down_with(&altgr, true, cx);
+                    view.replace_text_in_range(None, "@", window, cx);
+                })
+                .unwrap()
+        });
+        assert_eq!(take(), [r#"Text("@")"#], "no dispatchKeyEvent, the text as text");
+        cx.update(|cx| {
+            handle
+                .update(cx, |view, window, cx| {
+                    // where the OS does not take it (Linux), the chord and plain keys are as before
+                    view.key_down_with(&altgr, false, cx);
+                    view.key_down_with(&plain, false, cx);
+                    // the URL bar takes the OS's text while it is edited
+                    view.editing = Some("a".into());
+                    view.key_down_with(&altgr, true, cx);
+                    view.replace_text_in_range(None, "@", window, cx);
+                    assert_eq!(view.editing.as_deref(), Some("a@"));
+                })
+                .unwrap()
+        });
+        let got = take();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].starts_with("Key {") && got[0].contains("down: true"), "{got:?}");
+        assert_eq!(got[1], r#"Text("a")"#);
     }
 
     #[cfg(target_os = "linux")]
