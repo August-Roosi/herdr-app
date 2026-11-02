@@ -104,6 +104,7 @@ impl Chromium {
             "--remote-debugging-address=127.0.0.1",
             &format!("--remote-debugging-port={port}"),
             "--no-sandbox",
+            "--password-store=basic",
             &format!("--user-data-dir={}", dir.display()),
             "--window-size=1280,800",
             url,

@@ -54,6 +54,8 @@ struct Shared {
     source: Option<Box<dyn FrameSource>>,
     /// The image area in device px, as last told to the source.
     px: Option<(u32, u32)>,
+    /// The window's scale factor, as last laid out.
+    scale: Option<f32>,
     /// Where the frame was drawn, in window px.
     rect: Option<Bounds<Pixels>>,
     /// The image last drawn: dropped from the atlas when the next one is.
@@ -98,7 +100,7 @@ enum Attempt {
 
 /// Looks for `agent`'s browser and connects to it. Blocking core calls: run
 /// it off the UI thread.
-async fn attempt(core: &Arc<Core>, agent: &str, px: (u32, u32)) -> Attempt {
+async fn attempt(core: &Arc<Core>, agent: &str, px: (u32, u32), scale: Option<f32>) -> Attempt {
     let (machine, bare) = find::split(agent);
     // The core forwards the filter to each connected machine.
     let list = match core.call("terminal.list", json!({"labels": {"browser-for": bare}})) {
@@ -112,18 +114,19 @@ async fn attempt(core: &Arc<Core>, agent: &str, px: (u32, u32)) -> Attempt {
         _ => list.clone(),
     };
     match find::state_for(&list, &machines, agent) {
-        Lookup::Found(found) => connect(core, &found, px).await,
+        Lookup::Found(found) => connect(core, &found, px, find::is_cast(agent).then_some(scale.unwrap_or(1.0))).await,
         other => Attempt::Lookup(other),
     }
 }
 
-async fn connect(core: &Arc<Core>, found: &Found, px: (u32, u32)) -> Attempt {
-    connect_within(core, found, px, SETUP).await
+/// `cast`: the window's scale factor, for an agent's own browser.
+async fn connect(core: &Arc<Core>, found: &Found, px: (u32, u32), cast: Option<f32>) -> Attempt {
+    connect_within(core, found, px, cast, SETUP).await
 }
 
 /// Reaches the browser's debugging port; each step that waits on the
 /// browser fails after `limit` (a port that accepts but never answers).
-async fn connect_within(core: &Arc<Core>, found: &Found, px: (u32, u32), limit: Duration) -> Attempt {
+async fn connect_within(core: &Arc<Core>, found: &Found, px: (u32, u32), cast: Option<f32>, limit: Duration) -> Attempt {
     let on = found.machine.as_deref();
     let machine = on.unwrap_or(HERE).to_owned();
     // checked before the agent's machine: its browser is reached through here too
@@ -149,7 +152,10 @@ async fn connect_within(core: &Arc<Core>, found: &Found, px: (u32, u32), limit: 
         Err(a) => return a,
     };
     match cdp::within(limit, "websocket upgrade", Cdp::connect(ws, &path, found.port)).await {
-        Ok(cdp) => Attempt::Source(CdpScreencast::start(cdp, px)),
+        Ok(cdp) => Attempt::Source(match cast {
+            Some(scale) => CdpScreencast::start_cast(cdp, px, format!("{machine}:{}", found.port), scale),
+            None => CdpScreencast::start(cdp, px),
+        }),
         Err(e) => Attempt::Failed(e),
     }
 }
@@ -228,9 +234,12 @@ impl BrowserView {
         // Replacing the task drops a lookup still running on an older core.
         self._task = Some(cx.spawn(async move |this, cx| {
             loop {
-                let Ok(px) = this.update(cx, |view, _| view.shared.borrow().px.unwrap_or(FIRST_PX)) else { return };
+                let Ok((px, scale)) = this.update(cx, |view, _| {
+                    let shared = view.shared.borrow();
+                    (shared.px.unwrap_or(FIRST_PX), shared.scale)
+                }) else { return };
                 let (core, agent) = (core.clone(), agent.clone());
-                let tried = cx.background_executor().spawn(async move { attempt(&core, &agent, px).await }).await;
+                let tried = cx.background_executor().spawn(async move { attempt(&core, &agent, px, scale).await }).await;
                 match this.update(cx, |view, cx| view.attempted(tried, cx)) {
                     Ok(Some(rx)) => {
                         if !pump(&this, rx, cx).await {
@@ -726,10 +735,11 @@ impl Render for BrowserView {
                                 let mut shared = layout_shared.borrow_mut();
                                 if shared.px != Some(dev) {
                                     shared.px = Some(dev);
-                                    // Only the screencast's size: the page's viewport stays the agent's.
-                                    // (A cast may fit it to the pane later; `is_cast` says which.)
+                                    shared.scale = Some(scale);
+                                    // A view only changes the screencast's size (the page's viewport stays
+                                    // the agent's); a cast also fits the page to the pane.
                                     if let Some(source) = &shared.source {
-                                        source.resize(dev);
+                                        source.resize(dev, scale);
                                     }
                                 }
                             },
@@ -810,7 +820,7 @@ mod tests {
         fn select(&self, target: Option<String>) {
             self.calls.lock().unwrap().push(format!("select {target:?}"));
         }
-        fn resize(&self, px: (u32, u32)) {
+        fn resize(&self, px: (u32, u32), _scale: f32) {
             self.calls.lock().unwrap().push(format!("resize {}x{}", px.0, px.1));
         }
         fn stop(&self) {
@@ -1050,7 +1060,7 @@ mod tests {
         });
         let found = Found { machine: None, port, terminal: "t9".into() };
         let start = Instant::now();
-        let tried = cdp::block_on(connect_within(&core, &found, (800, 600), Duration::from_millis(300)));
+        let tried = cdp::block_on(connect_within(&core, &found, (800, 600), None, Duration::from_millis(300)));
         let Attempt::Failed(e) = tried else { panic!("a mute port must fail the attempt") };
         assert!(e.to_string().contains("no answer"), "{e:#}");
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
@@ -1084,7 +1094,7 @@ mod tests {
         let Some(iso) = crate::hc::tests::Isolated::new("browser-view") else { return };
         let core = iso.connect();
         let chrome = Chromium::start(&bin);
-        let tried = |agent: &str| cdp::block_on(attempt(&core, agent, (800, 600)));
+        let tried = |agent: &str| cdp::block_on(attempt(&core, agent, (800, 600), None));
         assert!(matches!(tried("t1"), Attempt::Lookup(Lookup::NoBrowser)));
         let labels = json!({"browser-for": "t1", "cdp": format!("127.0.0.1:{}", chrome.port)});
         core.run(vec!["sleep".into(), "60".into()], None, labels, None).unwrap();

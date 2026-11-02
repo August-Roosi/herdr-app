@@ -6,7 +6,8 @@ use super::cdp::{Cdp, Event, TargetInfo, Targets, pick_target};
 use super::input;
 use serde_json::{Value, json};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -67,7 +68,8 @@ pub trait FrameSource {
     /// Pins a target (`None`: follow the newest page).
     fn select(&self, target: Option<String>);
     /// The pane's size in device px: the screencast's max frame size.
-    fn resize(&self, px: (u32, u32));
+    /// The image area in device px, and the window's scale factor.
+    fn resize(&self, px: (u32, u32), scale: f32);
     fn stop(&self);
 }
 
@@ -88,6 +90,49 @@ pub struct CdpScreencast {
     // Kept for the tests' throughput checks; nothing in the app reads it yet.
     #[cfg_attr(not(test), allow(dead_code))]
     stats: Arc<Stats>,
+    scale: Option<Arc<AtomicU32>>,
+}
+
+/// What a cast needs: which browser it shows and the window's scale factor
+/// (shared with `resize`).
+struct Cast {
+    key: String,
+    scale: Arc<AtomicU32>,
+}
+
+/// Casts running per browser, process-wide: the page's override is cleared
+/// only when the last one of a browser stops.
+static CASTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+fn casts_add(key: &str) {
+    *CASTS.lock().unwrap().get_or_insert_default().entry(key.to_owned()).or_default() += 1;
+}
+
+/// Counts one cast less; true when it was the last of its browser.
+fn casts_remove(key: &str) -> bool {
+    let mut guard = CASTS.lock().unwrap();
+    let map = guard.get_or_insert_default();
+    match map.get_mut(key) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            false
+        }
+        _ => {
+            map.remove(key);
+            true
+        }
+    }
+}
+
+/// Whether `key` has a single cast running (the caller's own).
+fn casts_alone(key: &str) -> bool {
+    CASTS.lock().unwrap().as_ref().and_then(|m| m.get(key)).is_none_or(|n| *n <= 1)
+}
+
+/// The page size in CSS px for a pane of `px` device px at `scale`.
+fn css_size(px: (u32, u32), scale: f32) -> (u32, u32) {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    (((px.0 as f32 / scale).round() as u32).max(1), ((px.1 as f32 / scale).round() as u32).max(1))
 }
 
 /// Decoded frames and the time spent decoding them.
@@ -100,7 +145,24 @@ struct Stats {
 }
 
 impl CdpScreencast {
+    /// A view of the page: the page's own viewport is never touched.
     pub fn start(cdp: Cdp, px: (u32, u32)) -> Self {
+        Self::start_with(cdp, px, None)
+    }
+
+    /// A cast: while shown, the page's viewport follows the pane (`px` at
+    /// `scale`), so text is drawn 1:1. `key` names the browser (machine and
+    /// port): the override is cleared when its last cast stops.
+    pub fn start_cast(cdp: Cdp, px: (u32, u32), key: String, scale: f32) -> Self {
+        Self::start_with(cdp, px, Some(Cast { key, scale: Arc::new(AtomicU32::new(scale.to_bits())) }))
+    }
+
+    fn start_with(cdp: Cdp, px: (u32, u32), cast: Option<Cast>) -> Self {
+        let scale = cast.as_ref().map(|c| c.scale.clone());
+        let cast = cast.map(|c| {
+            casts_add(&c.key);
+            c
+        });
         let (cmds, cmd_rx) = async_channel::unbounded();
         let (out, frames) = Out::new();
         let out = Arc::new(out);
@@ -113,7 +175,12 @@ impl CdpScreencast {
         };
         let decoder = match decoder {
             Ok(d) => d,
-            Err(e) => return Self::failed(cmds, stats, e),
+            Err(e) => {
+                if let Some(c) = &cast {
+                    casts_remove(&c.key);
+                }
+                return Self::failed(cmds, stats, e);
+            }
         };
         // closes the slot (ending the decoder) however the worker ends: also
         // when it panics or never starts
@@ -126,6 +193,7 @@ impl CdpScreencast {
                 out: out.clone(),
                 slot: slot.clone(),
                 px,
+                cast,
                 targets: Targets::default(),
                 pinned: None,
                 shown: None,
@@ -140,6 +208,7 @@ impl CdpScreencast {
                 stats: worker_stats,
             };
             let r = w.run(cmd_rx, ack_rx);
+            w.finish_cast();
             slot.close();
             let _ = decoder.join();
             if r.is_err() {
@@ -147,7 +216,7 @@ impl CdpScreencast {
             }
         });
         match worker {
-            Ok(_) => CdpScreencast { cmds, frames, stats },
+            Ok(_) => CdpScreencast { cmds, frames, stats, scale },
             Err(e) => Self::failed(cmds, stats, e),
         }
     }
@@ -156,7 +225,7 @@ impl CdpScreencast {
         tracing::warn!("browser: cannot start screencast threads: {e}");
         let (out, frames) = Out::new();
         out.push(SourceEvent::Ended);
-        CdpScreencast { cmds, frames, stats }
+        CdpScreencast { cmds, frames, stats, scale: None }
     }
 
     /// The most calls the worker had in flight at once.
@@ -182,7 +251,10 @@ impl FrameSource for CdpScreencast {
     fn select(&self, target: Option<String>) {
         let _ = self.cmds.try_send(Cmd::Select(target));
     }
-    fn resize(&self, px: (u32, u32)) {
+    fn resize(&self, px: (u32, u32), scale: f32) {
+        if let Some(s) = &self.scale {
+            s.store(scale.to_bits(), Ordering::Relaxed);
+        }
         let _ = self.cmds.try_send(Cmd::Resize(px));
     }
     fn stop(&self) {
@@ -313,6 +385,8 @@ struct Worker {
     out: Arc<Out>,
     slot: Arc<Slot>,
     px: (u32, u32),
+    /// Set for a cast (see `start_cast`).
+    cast: Option<Cast>,
     targets: Targets,
     pinned: Option<String>,
     shown: Option<Shown>,
@@ -493,6 +567,9 @@ impl Worker {
         let want = pick_target(&self.targets.list, self.pinned.as_deref());
         if want.as_deref() != self.shown.as_ref().map(|s| s.target.as_str()) {
             if let Some(old) = self.shown.take() {
+                if self.cast.as_ref().is_some_and(|c| casts_alone(&c.key)) {
+                    self.call("Emulation.clearDeviceMetricsOverride", json!({}), Some(&old.session))?.ok();
+                }
                 self.call("Page.stopScreencast", json!({}), Some(&old.session))?.ok();
                 self.call("Target.detachFromTarget", json!({"sessionId": old.session}), None)?.ok();
             }
@@ -509,6 +586,7 @@ impl Worker {
         let Some(session) = r["sessionId"].as_str().map(str::to_string) else { return Ok(()) };
         self.call("Page.enable", json!({}), Some(&session))?.ok();
         self.shown = Some(Shown { target: target.clone(), session });
+        self.override_viewport()?;
         self.start_screencast()?;
         if let Some(t) = self.targets.list.iter().find(|t| t.id == target) {
             self.out.push(SourceEvent::Url(t.url.clone()));
@@ -516,10 +594,29 @@ impl Worker {
         Ok(())
     }
 
-    /// The viewport is the agent's: only the frames' max size follows the pane.
+    /// A cast fits the page's viewport to the pane. A view never does: the
+    /// viewport stays the agent's and only the frames' max size follows the pane.
+    fn override_viewport(&self) -> Result<(), Gone> {
+        let (Some(cast), Some(s)) = (&self.cast, &self.shown) else { return Ok(()) };
+        let (w, h) = css_size(self.px, f32::from_bits(cast.scale.load(Ordering::Relaxed)));
+        let params = json!({"width": w, "height": h, "deviceScaleFactor": f32::from_bits(cast.scale.load(Ordering::Relaxed)), "mobile": false});
+        self.call("Emulation.setDeviceMetricsOverride", params, Some(&s.session))?.ok();
+        Ok(())
+    }
+
+    /// When the worker ends: the last cast of a browser gives the page its own viewport back.
+    fn finish_cast(&mut self) {
+        let Some(cast) = self.cast.take() else { return };
+        if casts_remove(&cast.key) {
+            if let Some(s) = &self.shown {
+                let _ = self.call("Emulation.clearDeviceMetricsOverride", json!({}), Some(&s.session));
+            }
+        }
+    }
+
     fn start_screencast(&self) -> Result<(), Gone> {
         let Some(s) = &self.shown else { return Ok(()) };
-        let params = json!({"format": "jpeg", "quality": 70, "maxWidth": self.px.0, "maxHeight": self.px.1});
+        let params = json!({"format": "jpeg", "quality": 85, "maxWidth": self.px.0, "maxHeight": self.px.1});
         self.call("Page.startScreencast", params, Some(&s.session))?.ok();
         Ok(())
     }
@@ -587,6 +684,7 @@ impl Worker {
                 if let Some(s) = &self.shown {
                     self.call("Page.stopScreencast", json!({}), Some(&s.session))?.ok();
                 }
+                self.override_viewport()?;
                 self.start_screencast()
             }
             Cmd::Input(i) => self.input(i),
@@ -899,7 +997,7 @@ mod tests {
         let fake = FakeBrowser::start(Duration::from_millis(300));
         let source = CdpScreencast::start(fake.cdp(), (800, 600));
         for i in 0..50 {
-            source.resize((700 + i, 500));
+            source.resize((700 + i, 500), 1.0);
         }
         source.stop();
         ends(&source.frames());
@@ -999,7 +1097,7 @@ mod tests {
         assert!(n >= 10, "only {n} frames in 2 s: are frames acked?");
 
         // resize restarts the screencast with a smaller max size
-        source.resize((640, 400));
+        source.resize((640, 400), 1.0);
         wait(&rx, 3.0, "a smaller frame", |e| frame(e).filter(|f| f.image.size(0).width.0 <= 640));
         source.stop();
     }
@@ -1096,5 +1194,78 @@ mod tests {
         let again = CdpScreencast::start(chrome.cdp(), (800, 600));
         wait(&again.frames(), 3.0, "a frame after the restart", frame);
         again.stop();
+    }
+
+    /// `window.innerWidth` of the browser's first page, read over its own connection.
+    fn inner_width(chrome: &Chromium) -> i64 {
+        let cdp = chrome.cdp();
+        let r = cdp.call_blocking("Target.getTargets", json!({}), None).unwrap();
+        let id = r["targetInfos"].as_array().unwrap().iter().find(|t| t["type"] == "page").unwrap()["targetId"].as_str().unwrap().to_string();
+        let att = cdp.call_blocking("Target.attachToTarget", json!({"targetId": id, "flatten": true}), None).unwrap();
+        let session = att["sessionId"].as_str().unwrap().to_string();
+        let r = cdp.call_blocking("Runtime.evaluate", json!({"expression": "window.innerWidth", "returnByValue": true}), Some(&session)).unwrap();
+        r["result"]["value"].as_i64().unwrap()
+    }
+
+    fn width_becomes(chrome: &Chromium, want: i64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = inner_width(chrome);
+            if got == want {
+                return;
+            }
+            assert!(Instant::now() < deadline, "innerWidth {got}, want {want}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs HERDR_TEST_CHROMIUM (a chrome binary); run with --include-ignored"]
+    fn cast_viewport_follows_pane() {
+        let Some(bin) = chromium_bin() else { return };
+        let chrome = Chromium::start(&bin);
+        width_becomes(&chrome, 1280);
+        let source = CdpScreencast::start_cast(chrome.cdp(), (1000, 700), "test:cast_viewport".into(), 1.0);
+        width_becomes(&chrome, 1000);
+        source.resize((800, 600), 1.0);
+        width_becomes(&chrome, 800);
+        source.resize((1600, 1200), 2.0);
+        width_becomes(&chrome, 800);
+        source.stop();
+        width_becomes(&chrome, 1280);
+    }
+
+    #[test]
+    #[ignore = "needs HERDR_TEST_CHROMIUM (a chrome binary); run with --include-ignored"]
+    fn view_never_overrides() {
+        let Some(bin) = chromium_bin() else { return };
+        let chrome = Chromium::start(&bin);
+        let source = CdpScreencast::start(chrome.cdp(), (1000, 700));
+        let rx = source.frames();
+        wait(&rx, 5.0, "a frame", frame);
+        assert_eq!(inner_width(&chrome), 1280);
+        source.resize((800, 600), 1.0);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(inner_width(&chrome), 1280);
+        source.stop();
+    }
+
+    #[test]
+    fn cast_registry_clears_only_with_the_last_cast() {
+        let key = "test:registry";
+        casts_add(key);
+        casts_add(key);
+        assert!(!casts_alone(key));
+        assert!(!casts_remove(key));
+        assert!(casts_alone(key));
+        assert!(casts_remove(key), "the last one clears");
+        assert!(casts_alone(key));
+    }
+
+    #[test]
+    fn css_size_divides_by_the_scale() {
+        assert_eq!(css_size((1000, 700), 1.0), (1000, 700));
+        assert_eq!(css_size((1500, 900), 1.5), (1000, 600));
+        assert_eq!(css_size((0, 0), 0.0), (1, 1));
     }
 }
