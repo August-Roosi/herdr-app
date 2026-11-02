@@ -44,6 +44,8 @@ herdr-app do space.new --name "remote api" --machine vps --folder /srv/api
 ```
 
 The folder is on that machine; tabs and splits in the space stay there.
+New-space keys and clicks follow the focused space's machine. Script commands
+without `--machine` still use this computer; `--machine ''` explicitly chooses it.
 The agent menu checks and starts agents in the remote Unix user's
 login/interactive shell (sh, bash, zsh, dash, ksh or fish), including its
 configured PATH. Other shells keep the sh launcher.
@@ -103,6 +105,8 @@ those files or the generated guide. The app rewrites them on start.
 - Home defaults to `~/.config/herdr-app`; `HERDR_APP_HOME` selects another.
 - Mods live in `mods/<name>/` with `main.js` and optional `mod.json`.
   They are trusted JavaScript with command and network access.
+  `"focusable": true` in `mod.json` lets `pane.go` move onto a copy; it receives
+  `"focus"` from `nextCommand()` and focuses its own keyboard handle.
 - Shipped mods belong to Herdr: duplicate with `mod.clone` before editing.
   Shipped layouts likewise use `layout.clone` for a personal copy.
   Discover required arguments with `herdr-app commands`.

@@ -215,7 +215,8 @@ the title bar, panes as cards, a space picker) and `win98`
 ("Herdr 98": a whole desktop in one mod, `win98`). Add a layout by
 writing a new file. The Files panel supports Windows folder paths with spaces,
 parentheses and apostrophes, and preserves Unicode file and folder names
-(including Chinese).
+(including Chinese). Directory links expand as folders; their contents load
+only when expanded.
 
 **Herdr's own layouts and mods are read-only.** They are replaced whole
 on every start. Use settings.json for look (fonts, sizes, theme, colors,
@@ -546,7 +547,9 @@ types are rejected before a current-target default applies; null means omitted.
 The main ones:
 
 - Spaces: `space.new {name?, folder?, tab?, argv?, task?, machine?}`
-  (machine: another machine from `hc machine ls`; the space lives there, its
+  (machine: another machine from `hc machine ls`; omitted: the focused space's
+  machine for keys and clicks, this computer for scripts; `""`: this computer.
+  The space lives there, its
   terminals start in that machine's home unless folder, and its tabs and
   splits stay there; `spaces()` gives each space's `machine`, null here),
   `space.close {id?, confirmed?}`, `space.rename {id?, name}` ("": Herdr's name again),
@@ -567,6 +570,11 @@ The main ones:
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
   terminal, or a mod pane), `pane.close {pane?}`,
   `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`.
+  `pane.go` prefers the most recently focused pane along the nearest edge in that
+  direction; unvisited panes fall back to overlap, then top/left layout order.
+  `pane.go` also reaches visible mods whose `mod.json` says `"focusable": true`, and
+  starts from that mod while it holds the keyboard.
+  `pane.swap` uses geometry only. Focus history lasts until the window closes.
   `pane.focus {terminal}` prefers the first visible layout terminal block showing that
   address, then its model pane. Clicking a terminal block focuses it too.
   While a layout terminal block is focused, implicit split/close/zoom/go/swap and
@@ -776,6 +784,12 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
   mod.json    where it first appears: { "place": "right" | "left" | "top" | "bottom" | "none", "size": 320 }
   *.js, *.svg   more modules ("./ui.js"), its own icons
 ```
+
+- `"focusable": true` in `mod.json` lets `pane.go` give a shown copy the keyboard.
+  It gets `"focus"` from `nextCommand()`: focus your own handle then
+  (`this.handle.focus()`) and handle keys with `on_key_down`. The copy gets `"focus"`
+  again after a popup over it closes. Leave with `run("pane.go", {direction})`.
+  Without this opt-in, navigation and clicks stay unchanged.
 
 - The first time Herdr sees a folder, it docks one copy per `mod.json` into
   the shown layout (`"none"`: only where a layout or another mod puts it).
