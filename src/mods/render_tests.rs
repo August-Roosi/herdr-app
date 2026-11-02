@@ -44,7 +44,7 @@ impl Staged {
     fn wrapper(&self, entry: &str, setup: &str) -> PathBuf {
         let dir = self.0.clone();
         std::fs::write(dir.join("main.js"), format!(
-            "import Real from './{entry}/main.js'; export default class Scenario extends Real {{ init(props, cx) {{ super.init(props, cx); {setup} }} }}"
+            "import Real from './{entry}/main.js'; export default class Scenario extends Real {{ init(props, cx) {{ super.init?.(props, cx); {setup} }} }}"
         )).unwrap();
         dir
     }
@@ -719,6 +719,64 @@ fn pane_menu_shows_browser_only_with_a_live_one(cx: &mut TestAppContext) {
     let (_, effects) = describe_with_effects(cx, &staged, "mods/menu", values, Some("this.choose(3, cx);")).unwrap();
     let ran: Vec<&Vec<Value>> = effects.iter().filter(|(name, _)| name == "run").map(|(_, args)| args).collect();
     assert_eq!(ran, [&vec![json!("browser.show"), json!({"terminal":"t1","pane":"p7"})]], "{effects:?}");
+}
+
+#[gpui::test]
+fn pane_menu_offers_help_while_an_agent_asks(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let t = |address: &str, labels: Value| json!({"address":address,"name":address,"title":address,"argv":["pi"],"parent":null,"labels":labels,"state":"running","status":"working","report":{},"program":null,"cwd":"/x"});
+    let menu = |cx: &mut TestAppContext, terminals: Value, terminal: &str, choose: Option<&str>| {
+        let mut values = fixture(true, props(), updates("current", "current"));
+        let mut p = props();
+        p["tab"] = json!("pane");
+        p["target"] = json!({"pane":"p7","terminal":terminal});
+        values.insert("props".into(), p);
+        values.insert("terminals".into(), terminals);
+        describe_with_effects(cx, &staged, "mods/menu", values, choose).unwrap()
+    };
+    let asking = json!([t("rohan/t1", json!({"herdr.browser.help":"log in to GitHub"})), t("rohan/t2", json!({"browser-for":"t1"}))]);
+    let (tree, _) = menu(cx, asking.clone(), "rohan/t1", None);
+    assert!(tree.contains("Help in browser") && !tree.contains("Show browser"), "{tree}");
+    // Done (empty): the usual item again.
+    let (tree, _) = menu(cx, json!([t("rohan/t1", json!({"herdr.browser.help":""})), t("rohan/t2", json!({"browser-for":"t1"}))]), "rohan/t1", None);
+    assert!(tree.contains("Show browser") && !tree.contains("Help in browser"), "{tree}");
+    // Asking with no browser listed yet still offers it; it opens the cast.
+    let (tree, effects) = menu(cx, json!([t("t1", json!({"herdr.browser.help":"captcha"}))]), "t1", Some("this.choose(3, cx);"));
+    assert!(tree.contains("Help in browser"), "{tree}");
+    let ran: Vec<&Vec<Value>> = effects.iter().filter(|(name, _)| name == "run").map(|(_, args)| args).collect();
+    assert_eq!(ran, [&vec![json!("browser.show"), json!({"terminal":"t1","pane":"p7"})]], "{effects:?}");
+    let (_, effects) = menu(cx, asking, "rohan/t1", Some("this.choose(3, cx);"));
+    let ran: Vec<&Vec<Value>> = effects.iter().filter(|(name, _)| name == "run").map(|(_, args)| args).collect();
+    assert_eq!(ran, [&vec![json!("browser.show"), json!({"terminal":"rohan/t1","pane":"p7"})]], "{effects:?}");
+}
+
+#[gpui::test]
+fn a_toast_names_its_action_and_runs_it(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let toast = |cx: &mut TestAppContext, note: Value, setup: Option<&str>| {
+        let mut values = fixture(true, props(), updates("current", "current"));
+        let mut p = props();
+        p.as_object_mut().unwrap().extend(note.as_object().unwrap().clone());
+        p["overlay"] = json!("o1");
+        values.insert("props".into(), p);
+        describe_with_effects(cx, &staged, "mods/toast", values, setup).unwrap()
+    };
+    // The help request Herdr posts (browser::requests): an Open button.
+    let help = json!({"title":"claude needs you in its browser: log in to GitHub","level":"warning",
+        "action":{"name":"browser.show","args":{"terminal":"rohan/t1"},"label":"Open"}});
+    let (tree, _) = toast(cx, help.clone(), None);
+    assert!(tree.contains("log in to GitHub") && tree.contains("Open"), "{tree}");
+    let (_, effects) = toast(cx, help, Some("this.open();"));
+    assert_eq!(
+        effects,
+        [("run".to_owned(), vec![json!("browser.show"), json!({"terminal":"rohan/t1"})]), ("closeOverlay".to_owned(), vec![json!("o1")])],
+        "{effects:?}"
+    );
+    // Without a label, no button: the whole toast is the action.
+    let (tree, _) = toast(cx, json!({"title":"Done","action":{"name":"app.help"}}), None);
+    assert!(!tree.contains("Open"), "{tree}");
 }
 
 #[gpui::test]

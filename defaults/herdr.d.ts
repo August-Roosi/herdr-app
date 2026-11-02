@@ -63,7 +63,7 @@ export function playSound(sound: string): null;
  *   terminal.show {terminal?, pane?} (shown in the pane for now, in place of its own), terminal.copy, terminal.paste,
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
  * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too).
- * Browser: browser.show {terminal, place?: "right" | "down" | "tab", pane?} (an agent's browser in a pane; "base": the login browser).
+ * Browser: browser.show {terminal, place?: "right" | "down" | "tab", pane?} (an agent's browser in a pane; "base": the login browser; "view": the person's own, in any space).
  * Layout (the shown layout's nodes by id): layout.toggle|show|hide {id}, layout.resize {id, px | weight},
  *   layout.select {stack, child}, layout.set {layout} (personal trees; shipped layouts: click/look fields only), layout.switch {name?} (no name: the next one).
  *   layout.clone {name, as?} duplicates and switches; mod.clone {name, as?} duplicates a mod.
@@ -375,7 +375,8 @@ export function notify(n: {
   level?: "info" | "success" | "warning" | "error";
   timeout?: number;
   icon?: string;
-  action?: { name: string; args?: Record<string, unknown> };
+  /** `label`: also shown as a button (e.g. "Open"). */
+  action?: { name: string; args?: Record<string, unknown>; label?: string };
 }): string;
 
 /** The props this copy of the mod was given in the layout (or overlay).

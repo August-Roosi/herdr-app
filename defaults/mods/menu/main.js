@@ -41,11 +41,15 @@ function items(p, git) {
             t.labels?.["browser-for"] === term.address.slice(at(term.address)) &&
             t.address.slice(0, at(t.address)) === term.address.slice(0, at(term.address)),
         );
+      // An agent asking for help in its browser (herdr-browser help): the same cast.
+      const help = Boolean(term?.labels?.["herdr.browser.help"]);
       return [
         ["Split right", "pane.split", { direction: "right", pane: tg.pane }],
         ["Split down", "pane.split", { direction: "down", pane: tg.pane }],
         ["Zoom", "pane.zoom", { pane: tg.pane }],
-        ...(hasBrowser ? [["Show browser", "browser.show", { terminal: term.address, pane: tg.pane }]] : []),
+        ...(help || hasBrowser
+          ? [[help ? "Help in browser" : "Show browser", "browser.show", { terminal: term.address, pane: tg.pane }]]
+          : []),
         ...(term
           ? [
               toProgram
