@@ -6,9 +6,11 @@
 //! quit, or before opening the next window after a crash. The first start
 //! after a swap runs `hc update` for the core.
 //!
-//! A build from source never updates: only `scripts/package` (the release
-//! builds) sets `HERDR_APP_RELEASE`. `scripts/install-macos` makes a
-//! Herdr.app too, so the install's shape alone can't tell.
+//! This fork never updates on its own: an update from releases.herdr.dev
+//! would put the official builds (without the fork's features) in place of
+//! its own. Checks run only when `HERDR_RELEASES_URL` is set explicitly (a
+//! test or a fork release server); `scripts/package`'s `HERDR_APP_RELEASE`
+//! no longer turns them on.
 //!
 //! The core is checked on the same clock (`core/latest.json`): a newer core
 //! of the same generation is offered (also applied after an app update), unless
@@ -116,13 +118,24 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
     c.managed = managed;
 }
 
-fn checks_app() -> Option<PathBuf> {
-    root().filter(|_| option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some())
+/// What `app.check_updates` and `app.update_core` say while updates are off.
+pub const OFF: &str = "updates are off in this build (fork)";
+
+/// Updates only with a release server named explicitly (see the top).
+fn updates_on(releases_url: Option<&std::ffi::OsStr>) -> bool {
+    releases_url.is_some_and(|url| !url.is_empty())
 }
 
-/// A release build checks the core; a source build only when pointed at a test release server.
+pub fn enabled() -> bool {
+    updates_on(std::env::var_os("HERDR_RELEASES_URL").as_deref())
+}
+
+fn checks_app() -> Option<PathBuf> {
+    root().filter(|_| enabled())
+}
+
 fn checks_core() -> bool {
-    option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some()
+    enabled()
 }
 
 /// For the settings screen: both programs, what's waiting, when we last looked.
@@ -576,7 +589,7 @@ fn marker() -> PathBuf {
 /// Cores before 0.1.5 lack `--version`: they keep their same-generation update
 /// path. A core a package manager owns is left alone (hc says so).
 pub fn after_update() {
-    if std::fs::remove_file(marker()).is_err() {
+    if std::fs::remove_file(marker()).is_err() || !enabled() {
         return;
     }
     std::thread::spawn(|| {
@@ -607,6 +620,13 @@ pub fn after_update() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updates_are_off_unless_a_release_server_is_named() {
+        assert!(!updates_on(None), "the fork never checks releases.herdr.dev by itself");
+        assert!(!updates_on(Some(std::ffi::OsStr::new(""))));
+        assert!(updates_on(Some(std::ffi::OsStr::new("http://127.0.0.1:8000"))));
+    }
 
     #[test]
     fn failed_check_clears_success_and_recovery_records_a_new_time() {

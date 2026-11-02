@@ -673,7 +673,11 @@ What's about the user, never a look:
   precedence as fonts.
 - `appearance`: `"light"` or `"dark"` always; absent, the system's. A layout
   with a light and a dark theme shows the matching one.
-- Updates: an installed app downloads them by itself and offers Restart and
+- Updates are off in this build (a fork): it never checks releases.herdr.dev
+  or updates herdr-core from there, so the official builds never replace it.
+  `app.check_updates` and `app.update_core` answer "updates are off in this
+  build (fork)". Only an explicitly set `HERDR_RELEASES_URL` turns the checks
+  below back on. With it, an installed app downloads them by itself and offers Restart and
   What changed. If the app crashes or is killed with a verified newer update
   waiting, the next launch installs it before opening a window. The first
   start after an app update also updates herdr-core

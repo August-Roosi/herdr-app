@@ -3361,6 +3361,7 @@ impl AppWindow {
                 }
                 return;
             }
+            "app.check_updates" | "app.update_core" if !crate::update::enabled() => return self.fail(crate::update::OFF),
             "app.check_updates" => crate::update::check_now(),
             "app.update_core" => {
                 if crate::update::core().ready.is_none() && crate::update::core().error.is_none() {
