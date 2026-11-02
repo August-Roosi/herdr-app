@@ -275,7 +275,12 @@ impl BrowserView {
             source.select(self.shown.clone());
         }
         let rx = source.frames();
-        self.shared.borrow_mut().source = Some(source);
+        let mut shared = self.shared.borrow_mut();
+        // the lookup may have used an older size than the layout's by now
+        if let (Some(px), Some(scale)) = (shared.px, shared.scale) {
+            source.resize(px, scale);
+        }
+        shared.source = Some(source);
         rx
     }
 
@@ -733,7 +738,7 @@ impl Render for BrowserView {
                                 let scale = window.scale_factor();
                                 let dev = ((f32::from(bounds.size.width) * scale).round().max(1.0) as u32, (f32::from(bounds.size.height) * scale).round().max(1.0) as u32);
                                 let mut shared = layout_shared.borrow_mut();
-                                if shared.px != Some(dev) {
+                                if shared.px != Some(dev) || shared.scale != Some(scale) {
                                     shared.px = Some(dev);
                                     shared.scale = Some(scale);
                                     // A view only changes the screencast's size (the page's viewport stays

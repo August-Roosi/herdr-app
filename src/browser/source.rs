@@ -98,6 +98,21 @@ pub struct CdpScreencast {
 struct Cast {
     key: String,
     scale: Arc<AtomicU32>,
+    /// Still counted in `CASTS`: a drop (also a panic's, or a failed spawn's) uncounts it.
+    counted: bool,
+}
+
+impl Cast {
+    /// Uncounts the cast; true when it was the last of its browser.
+    fn release(&mut self) -> bool {
+        std::mem::take(&mut self.counted) && casts_remove(&self.key)
+    }
+}
+
+impl Drop for Cast {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Casts running per browser, process-wide: the page's override is cleared
@@ -154,15 +169,14 @@ impl CdpScreencast {
     /// `scale`), so text is drawn 1:1. `key` names the browser (machine and
     /// port): the override is cleared when its last cast stops.
     pub fn start_cast(cdp: Cdp, px: (u32, u32), key: String, scale: f32) -> Self {
-        Self::start_with(cdp, px, Some(Cast { key, scale: Arc::new(AtomicU32::new(scale.to_bits())) }))
+        Self::start_with(cdp, px, Some(Cast { key, scale: Arc::new(AtomicU32::new(scale.to_bits())), counted: true }))
     }
 
     fn start_with(cdp: Cdp, px: (u32, u32), cast: Option<Cast>) -> Self {
         let scale = cast.as_ref().map(|c| c.scale.clone());
-        let cast = cast.map(|c| {
+        if let Some(c) = &cast {
             casts_add(&c.key);
-            c
-        });
+        }
         let (cmds, cmd_rx) = async_channel::unbounded();
         let (out, frames) = Out::new();
         let out = Arc::new(out);
@@ -175,12 +189,7 @@ impl CdpScreencast {
         };
         let decoder = match decoder {
             Ok(d) => d,
-            Err(e) => {
-                if let Some(c) = &cast {
-                    casts_remove(&c.key);
-                }
-                return Self::failed(cmds, stats, e);
-            }
+            Err(e) => return Self::failed(cmds, stats, e),
         };
         // closes the slot (ending the decoder) however the worker ends: also
         // when it panics or never starts
@@ -193,6 +202,7 @@ impl CdpScreencast {
                 out: out.clone(),
                 slot: slot.clone(),
                 px,
+                applied_scale: cast.as_ref().map_or(0, |c| c.scale.load(Ordering::Relaxed)),
                 cast,
                 targets: Targets::default(),
                 pinned: None,
@@ -208,12 +218,13 @@ impl CdpScreencast {
                 stats: worker_stats,
             };
             let r = w.run(cmd_rx, ack_rx);
-            w.finish_cast();
             slot.close();
             let _ = decoder.join();
             if r.is_err() {
                 out.push(SourceEvent::Ended);
             }
+            // after the view heard of the end; a lost link has nothing to clear
+            w.finish_cast(r.is_ok());
         });
         match worker {
             Ok(_) => CdpScreencast { cmds, frames, stats, scale },
@@ -264,6 +275,9 @@ impl FrameSource for CdpScreencast {
 
 /// How far a call may go unanswered before the source gives up.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the last cast waits for the page to take its override off.
+const CLEAR_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The view's channel. Events (urls, targets, the end) are never dropped;
 /// of frames only the latest waits, so a slow view skips to the newest.
@@ -387,6 +401,8 @@ struct Worker {
     px: (u32, u32),
     /// Set for a cast (see `start_cast`).
     cast: Option<Cast>,
+    /// The cast's scale (bits) as last sent.
+    applied_scale: u32,
     targets: Targets,
     pinned: Option<String>,
     shown: Option<Shown>,
@@ -596,20 +612,25 @@ impl Worker {
 
     /// A cast fits the page's viewport to the pane. A view never does: the
     /// viewport stays the agent's and only the frames' max size follows the pane.
-    fn override_viewport(&self) -> Result<(), Gone> {
-        let (Some(cast), Some(s)) = (&self.cast, &self.shown) else { return Ok(()) };
-        let (w, h) = css_size(self.px, f32::from_bits(cast.scale.load(Ordering::Relaxed)));
-        let params = json!({"width": w, "height": h, "deviceScaleFactor": f32::from_bits(cast.scale.load(Ordering::Relaxed)), "mobile": false});
+    fn override_viewport(&mut self) -> Result<(), Gone> {
+        let Some(cast) = &self.cast else { return Ok(()) };
+        let bits = cast.scale.load(Ordering::Relaxed);
+        self.applied_scale = bits;
+        let Some(s) = &self.shown else { return Ok(()) };
+        let scale = f32::from_bits(bits);
+        let (w, h) = css_size(self.px, scale);
+        let params = json!({"width": w, "height": h, "deviceScaleFactor": scale, "mobile": false});
         self.call("Emulation.setDeviceMetricsOverride", params, Some(&s.session))?.ok();
         Ok(())
     }
 
     /// When the worker ends: the last cast of a browser gives the page its own viewport back.
-    fn finish_cast(&mut self) {
-        let Some(cast) = self.cast.take() else { return };
-        if casts_remove(&cast.key) {
+    fn finish_cast(&mut self, link_alive: bool) {
+        let Some(mut cast) = self.cast.take() else { return };
+        if cast.release() && link_alive {
             if let Some(s) = &self.shown {
-                let _ = self.call("Emulation.clearDeviceMetricsOverride", json!({}), Some(&s.session));
+                let call = self.cdp.call("Emulation.clearDeviceMetricsOverride", json!({}), Some(&s.session));
+                let _ = block_on_deadline(call, Instant::now() + CLEAR_TIMEOUT);
             }
         }
     }
@@ -677,7 +698,8 @@ impl Worker {
                 self.follow()
             }
             Cmd::Resize(px) => {
-                if px == self.px {
+                let scale = self.cast.as_ref().map_or(self.applied_scale, |c| c.scale.load(Ordering::Relaxed));
+                if px == self.px && scale == self.applied_scale {
                     return Ok(());
                 }
                 self.px = px;
@@ -1237,6 +1259,19 @@ mod tests {
 
     #[test]
     #[ignore = "needs HERDR_TEST_CHROMIUM (a chrome binary); run with --include-ignored"]
+    fn cast_started_with_a_stale_size_gets_the_pane_size() {
+        let Some(bin) = chromium_bin() else { return };
+        let chrome = Chromium::start(&bin);
+        // the view starts a lookup with a first guess, then tells the real size
+        let source = CdpScreencast::start_cast(chrome.cdp(), (1000, 700), "test:stale".into(), 1.0);
+        source.resize((900, 600), 1.5);
+        width_becomes(&chrome, 600);
+        source.stop();
+        width_becomes(&chrome, 1280);
+    }
+
+    #[test]
+    #[ignore = "needs HERDR_TEST_CHROMIUM (a chrome binary); run with --include-ignored"]
     fn view_never_overrides() {
         let Some(bin) = chromium_bin() else { return };
         let chrome = Chromium::start(&bin);
@@ -1260,6 +1295,22 @@ mod tests {
         assert!(casts_alone(key));
         assert!(casts_remove(key), "the last one clears");
         assert!(casts_alone(key));
+    }
+
+    #[test]
+    fn a_dropped_cast_uncounts_itself() {
+        let key = "test:guard".to_string();
+        casts_add(&key);
+        casts_add(&key);
+        let a = Cast { key: key.clone(), scale: Arc::new(AtomicU32::new(1)), counted: true };
+        let mut b = Cast { key: key.clone(), scale: Arc::new(AtomicU32::new(1)), counted: true };
+        drop(a);
+        assert!(casts_alone(&key));
+        assert!(b.release(), "the last one clears");
+        assert!(!b.release(), "once");
+        drop(b);
+        assert!(casts_alone(&key));
+        assert!(CASTS.lock().unwrap().as_ref().unwrap().get(&key).is_none());
     }
 
     #[test]
