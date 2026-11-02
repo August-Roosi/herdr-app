@@ -411,6 +411,8 @@ pub struct AppWindow {
     terminals_seen: bool,
     /// What agents ask of the browser panes through their labels.
     browser_requests: crate::browser::requests::Requests,
+    /// `herdr-browser view` is running for a request (it hasn't answered yet).
+    view_starting: bool,
     /// Live folders by address (from the shell process).
     cwds: HashMap<String, String>,
     /// When each terminal's repo and branch were last read, and what it was doing.
@@ -503,6 +505,7 @@ impl AppWindow {
             listed_once: false,
             terminals_seen: false,
             browser_requests: Default::default(),
+            view_starting: false,
             cwds: HashMap::new(),
             folders_checked: HashMap::new(),
             born: RefCell::new(HashMap::new()),
@@ -2012,7 +2015,7 @@ impl AppWindow {
             match ask {
                 Ask::Mine { terminal, pane } => {
                     tracing::info!("{terminal} asks for your browser");
-                    if !requests::view_running(&self.live) && !self.start_view_browser(window, cx) {
+                    if !requests::view_running(&self.live) && !self.view_starting && !self.start_view_browser(window, cx) {
                         continue;
                     }
                     let mut args = json!({ "terminal": VIEW });
@@ -2022,20 +2025,24 @@ impl AppWindow {
                     self.run("browser.show", args, window, cx);
                 }
                 Ask::Own { agent, pane } => {
-                    // Nobody asked: a failure is only logged.
-                    let r = self.run_as("browser.show", json!({ "terminal": agent, "pane": pane }), false, window, cx);
-                    if let Some(e) = r.get("error").and_then(Value::as_str) {
-                        tracing::warn!("showing {agent}'s browser: {e}");
+                    // Nobody asked: the keyboard stays where it is, and a
+                    // failure is only logged.
+                    match self.require_document(None).and_then(|_| place::show_quietly(&mut self.model, &agent, &pane)) {
+                        Ok(_) => {
+                            self.sync(window, cx);
+                            self.flush_documents(false, window, cx);
+                        }
+                        Err(e) => tracing::warn!("showing {agent}'s browser: {e}"),
                     }
                 }
-                Ask::Help { terminal, name, message } => {
+                Ask::Help { terminal, name, message, pane } => {
                     let notification = json!({
                         // The message on its own line: the title line is short.
                         "title": format!("{name} needs you in its browser"),
                         "body": message,
                         "level": "warning",
                         "timeout": 60000,
-                        "action": { "name": "browser.show", "args": { "terminal": terminal }, "label": "Open" },
+                        "action": requests::help_action(&terminal, pane.as_deref()),
                     });
                     self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
                 }
@@ -2053,16 +2060,32 @@ impl AppWindow {
             return false;
         };
         let core = crate::core_bin::path();
-        cx.background_executor()
-            .spawn(async move {
-                let out = crate::spawn::command(&bin).arg("view").env("HERDR_BROWSER_HC", &core).stdin(std::process::Stdio::null()).output();
-                match out {
-                    Ok(o) if o.status.success() => tracing::info!("view browser: {}", String::from_utf8_lossy(&o.stdout).trim()),
-                    Ok(o) => tracing::warn!("{} view failed: {}", bin.display(), String::from_utf8_lossy(&o.stderr).trim()),
-                    Err(e) => tracing::warn!("cannot run {}: {e}", bin.display()),
+        // Until it answers: more requests reuse this start.
+        self.view_starting = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let failed = cx
+                .background_executor()
+                .spawn(async move {
+                    match crate::spawn::command(&bin).arg("view").env("HERDR_BROWSER_HC", &core).stdin(std::process::Stdio::null()).output() {
+                        Ok(o) if o.status.success() => {
+                            tracing::info!("view browser: {}", String::from_utf8_lossy(&o.stdout).trim());
+                            None
+                        }
+                        Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_owned()).filter(|e| !e.is_empty()).or_else(|| Some(format!("{} view exited with {}", bin.display(), o.status))),
+                        Err(e) => Some(format!("cannot run {}: {e}", bin.display())),
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.view_starting = false;
+                if let Some(error) = failed {
+                    tracing::warn!("view browser: {error}");
+                    let spec = json!({"kind":"toast", "notification":{"title":"Your browser did not start","body":error,"level":"error"}});
+                    this.open_overlay(mods::new_overlay_id(), spec, window, cx);
                 }
-            })
-            .detach();
+            });
+        })
+        .detach();
         true
     }
 

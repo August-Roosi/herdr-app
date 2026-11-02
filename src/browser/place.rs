@@ -82,6 +82,32 @@ pub fn show(model: &mut Model, agent: &str, place: Place, pane: Option<String>) 
     }
 }
 
+/// Shows `agent`'s browser beside its `pane` without moving the keyboard:
+/// focus, the shown tab and space stay as they are (nobody asked, the
+/// person may be typing). One already shown is left where it is.
+pub fn show_quietly(model: &mut Model, agent: &str, pane: &str) -> Result<Value, String> {
+    let content = block_content(agent);
+    if let Some(id) = model.tabs().flat_map(|c| c.root.panes()).find(|n| n.content() == Some(&content)).map(|n| n.id.clone()) {
+        return Ok(json!({ "pane": id }));
+    }
+    let machine = find::split(agent).0;
+    let space = model.space_of(pane).ok_or_else(|| format!("no pane {pane:?}"))?;
+    if agent != find::VIEW && space.machine.as_deref() != machine {
+        return Err(format!("{agent}'s browser goes in a space on {}", machine.unwrap_or("this computer")));
+    }
+    let on_machine = space.machine.clone();
+    let tab = model.tab_of(pane).ok_or_else(|| format!("no pane {pane:?}"))?;
+    let (tab_id, focused, before) = (tab.id.clone(), tab.focused.clone(), tab.before.clone());
+    let id = model.fresh_id_on("p", on_machine.as_deref());
+    if !model.split_with(pane, Axis::Row, Node::block(&id, content)) {
+        return Err(format!("no pane {pane:?}"));
+    }
+    if let Some(t) = model.tab_mut(&tab_id) {
+        (t.focused, t.before) = (focused, before);
+    }
+    Ok(json!({ "pane": id }))
+}
+
 fn block_content(agent: &str) -> Content {
     Content::Browser { browser: agent.to_owned() }
 }
@@ -211,6 +237,54 @@ mod tests {
         let r = show(&mut m, "view", Place::Tab, None).unwrap();
         assert_eq!(r["space"], json!("rohan/s1"));
         assert!(r["pane"].as_str().unwrap().starts_with("rohan/"));
+    }
+
+    #[test]
+    fn showing_quietly_keeps_focus_tab_and_space() {
+        let mut m = model();
+        m.split("x1", Axis::Row, "x2", "t2");
+        m.focus_pane("x2");
+        m.add_space("s2", "web", "/web", Tab::new("c2", "", "x3", "t3"));
+        assert_eq!(m.active.as_deref(), Some("s2"));
+        let before = m.tab("c1").unwrap().before.clone();
+        // t1's browser starts while the user types in another space.
+        let r = show_quietly(&mut m, "t1", "x1").unwrap();
+        let pane = r["pane"].as_str().unwrap().to_owned();
+        assert_eq!(m.tab("c1").unwrap().root.find(&pane).unwrap().content().cloned(), browser("t1"));
+        assert_eq!(m.active.as_deref(), Some("s2"), "space unchanged");
+        assert_eq!(m.focused_pane().as_deref(), Some("x3"));
+        let c1 = m.tab("c1").unwrap();
+        assert_eq!(c1.focused.as_deref(), Some("x2"), "the agent's tab keeps its focused pane");
+        assert_eq!(c1.before, before);
+        // Already shown (elsewhere, in another tab): nothing moves.
+        m.focus_pane("x3");
+        assert_eq!(show_quietly(&mut m, "t1", "x1").unwrap()["pane"], json!(pane));
+        assert_eq!(m.active.as_deref(), Some("s2"));
+        assert_eq!(m.focused_pane().as_deref(), Some("x3"));
+        assert_eq!(m.tab("c1").unwrap().root.panes().len(), 3);
+        // Same tab, same rule.
+        let mut m = model();
+        let r = show_quietly(&mut m, "t1", "x1").unwrap();
+        assert_ne!(r["pane"], json!("x1"));
+        assert_eq!(m.focused_pane().as_deref(), Some("x1"));
+        assert!(show_quietly(&mut m, "t2", "nope").is_err());
+    }
+
+    #[test]
+    fn a_remote_agents_browser_opens_beside_its_pane_from_anywhere() {
+        // Help's Open passes the agent's pane: focus on this computer is fine.
+        let mut m = model();
+        crate::mirror::Document::capture(&m, None).replace(&mut m, Some("rohan"));
+        m.focus_pane("x1");
+        assert!(show(&mut m, "rohan/t1", Place::Right, None).is_err(), "beside a local pane: not allowed");
+        let r = show(&mut m, "rohan/t1", Place::Right, Some("rohan/x1".into())).unwrap();
+        assert!(r["pane"].as_str().unwrap().starts_with("rohan/"));
+        // No pane: a tab in a space on its machine.
+        let mut m = model();
+        crate::mirror::Document::capture(&m, None).replace(&mut m, Some("rohan"));
+        m.focus_pane("x1");
+        let r = show(&mut m, "rohan/t9", Place::Tab, None).unwrap();
+        assert_eq!(r["space"], json!("rohan/s1"));
     }
 
     #[test]

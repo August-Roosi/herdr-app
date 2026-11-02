@@ -29,8 +29,9 @@ pub enum Ask {
     Mine { terminal: String, pane: Option<String> },
     /// Show local agent `agent`'s own browser beside its `pane`.
     Own { agent: String, pane: String },
-    /// Tell the user `terminal` (called `name`) needs them in its browser.
-    Help { terminal: String, name: String, message: String },
+    /// Tell the user `terminal` (called `name`) needs them in its browser;
+    /// `pane`: the agent's, to open its browser beside.
+    Help { terminal: String, name: String, message: String, pane: Option<String> },
 }
 
 #[derive(Default)]
@@ -97,7 +98,7 @@ impl Requests {
                     self.help.insert(address.clone(), v.to_owned());
                     if news {
                         let name = rec.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(address);
-                        asks.push(Ask::Help { terminal: address.clone(), name: name.to_owned(), message: v.to_owned() });
+                        asks.push(Ask::Help { terminal: address.clone(), name: name.to_owned(), message: v.to_owned(), pane: pane_of(address) });
                     }
                 }
                 Some(_) => {}
@@ -120,6 +121,17 @@ impl Requests {
         self.listed.extend(machines.into_iter().map(str::to_owned));
         asks
     }
+}
+
+/// The help toast's Open: the agent's browser beside its pane, else in a
+/// tab in a space on its machine (never beside whatever is focused, which
+/// may be on another machine).
+pub fn help_action(terminal: &str, pane: Option<&str>) -> Value {
+    let args = match pane {
+        Some(pane) => serde_json::json!({ "terminal": terminal, "pane": pane }),
+        None => serde_json::json!({ "terminal": terminal, "place": "tab" }),
+    };
+    serde_json::json!({ "name": "browser.show", "args": args, "label": "Open" })
 }
 
 /// Whether this machine's view browser runs (a live local `browser-for=view`).
@@ -197,7 +209,7 @@ mod tests {
         assert_eq!(r.step(&live(&[("t1", json!({HELP: "old"}))]), panes), []);
         let mut l = live(&[("t1", json!({HELP: "log in to GitHub"}))]);
         l.get_mut("t1").unwrap()["name"] = json!("claude");
-        let help = Ask::Help { terminal: "t1".into(), name: "claude".into(), message: "log in to GitHub".into() };
+        let help = Ask::Help { terminal: "t1".into(), name: "claude".into(), message: "log in to GitHub".into(), pane: Some("p-t1".into()) };
         assert_eq!(r.step(&l, panes), [help.clone()]);
         assert_eq!(r.step(&l, panes), []);
         // Done, then the same request again: news again.
@@ -210,7 +222,20 @@ mod tests {
         );
         assert_eq!(
             r.step(&live(&[("t1", json!({})), ("rohan/t2", json!({HELP: "captcha"}))]), panes),
-            [Ask::Help { terminal: "rohan/t2".into(), name: "rohan/t2".into(), message: "captcha".into() }]
+            [Ask::Help { terminal: "rohan/t2".into(), name: "rohan/t2".into(), message: "captcha".into(), pane: Some("p-rohan/t2".into()) }]
+        );
+    }
+
+    #[test]
+    fn help_opens_beside_the_agents_pane_or_in_a_tab() {
+        // A remote agent: its own pane, wherever focus is.
+        assert_eq!(help_action("rohan/t2", Some("rohan/p4")), json!({"name": "browser.show", "args": {"terminal": "rohan/t2", "pane": "rohan/p4"}, "label": "Open"}));
+        assert_eq!(help_action("rohan/t2", None), json!({"name": "browser.show", "args": {"terminal": "rohan/t2", "place": "tab"}, "label": "Open"}));
+        let mut r = Requests::default();
+        r.step(&live(&[("rohan/t2", json!({}))]), none);
+        assert_eq!(
+            r.step(&live(&[("rohan/t2", json!({HELP: "captcha"}))]), none),
+            [Ask::Help { terminal: "rohan/t2".into(), name: "rohan/t2".into(), message: "captcha".into(), pane: None }]
         );
     }
 
