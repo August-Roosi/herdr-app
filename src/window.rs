@@ -407,6 +407,10 @@ pub struct AppWindow {
     /// Core's terminal records by address.
     live: HashMap<String, Value>,
     listed_once: bool,
+    /// Whether the core's terminal list came at least once (`live` is real).
+    terminals_seen: bool,
+    /// What agents ask of the browser panes through their labels.
+    browser_requests: crate::browser::requests::Requests,
     /// Live folders by address (from the shell process).
     cwds: HashMap<String, String>,
     /// When each terminal's repo and branch were last read, and what it was doing.
@@ -497,6 +501,8 @@ impl AppWindow {
             watched: Watched::default(),
             live: HashMap::new(),
             listed_once: false,
+            terminals_seen: false,
+            browser_requests: Default::default(),
             cwds: HashMap::new(),
             folders_checked: HashMap::new(),
             born: RefCell::new(HashMap::new()),
@@ -1934,6 +1940,7 @@ impl AppWindow {
             }
         }
         self.live = live;
+        self.terminals_seen = true;
         self.closing_terminals.retain(|addr, completed| !*completed || self.live.contains_key(addr));
         // A new sub-agent changes only this list; mods that show teams need to redraw.
         let terminals_changed = mods::publish_terminals(list);
@@ -1988,6 +1995,75 @@ impl AppWindow {
         } else if listed {
             self.publish(cx);
         }
+        self.answer_browser_requests(window, cx);
+    }
+
+    /// Shows what agents ask for (browser::requests): the user's own browser
+    /// beside an agent, a local agent's own browser when it starts, a help
+    /// request as a toast.
+    fn answer_browser_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::browser::{find::VIEW, requests::{self, Ask}};
+        if !self.terminals_seen {
+            return;
+        }
+        let model = &self.model;
+        let asks = self.browser_requests.step(&self.live, |a| model.pane_of(a));
+        for ask in asks {
+            match ask {
+                Ask::Mine { terminal, pane } => {
+                    tracing::info!("{terminal} asks for your browser");
+                    if !requests::view_running(&self.live) && !self.start_view_browser(window, cx) {
+                        continue;
+                    }
+                    let mut args = json!({ "terminal": VIEW });
+                    if let Some(pane) = pane {
+                        args["pane"] = pane.into();
+                    }
+                    self.run("browser.show", args, window, cx);
+                }
+                Ask::Own { agent, pane } => {
+                    // Nobody asked: a failure is only logged.
+                    let r = self.run_as("browser.show", json!({ "terminal": agent, "pane": pane }), false, window, cx);
+                    if let Some(e) = r.get("error").and_then(Value::as_str) {
+                        tracing::warn!("showing {agent}'s browser: {e}");
+                    }
+                }
+                Ask::Help { terminal, name, message } => {
+                    let notification = json!({
+                        // The message on its own line: the title line is short.
+                        "title": format!("{name} needs you in its browser"),
+                        "body": message,
+                        "level": "warning",
+                        "timeout": 60000,
+                        "action": { "name": "browser.show", "args": { "terminal": terminal }, "label": "Open" },
+                    });
+                    self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+                }
+            }
+        }
+    }
+
+    /// Starts the user's own browser on this machine (`herdr-browser view`,
+    /// which runs it through this core, without a parent, so it outlives the
+    /// app). False when herdr-browser isn't installed.
+    fn start_view_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(bin) = crate::browser::requests::find_bin() else {
+            let spec = json!({"kind":"toast", "notification":{"title":"herdr-browser is not installed","body":"Install it to open your browser in Herdr.","level":"error"}});
+            self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+            return false;
+        };
+        let core = crate::core_bin::path();
+        cx.background_executor()
+            .spawn(async move {
+                let out = crate::spawn::command(&bin).arg("view").env("HERDR_BROWSER_HC", &core).stdin(std::process::Stdio::null()).output();
+                match out {
+                    Ok(o) if o.status.success() => tracing::info!("view browser: {}", String::from_utf8_lossy(&o.stdout).trim()),
+                    Ok(o) => tracing::warn!("{} view failed: {}", bin.display(), String::from_utf8_lossy(&o.stderr).trim()),
+                    Err(e) => tracing::warn!("cannot run {}: {e}", bin.display()),
+                }
+            })
+            .detach();
+        true
     }
 
     /// Tells the person an agent needs them or finished: Herdr's sounds, and a
@@ -2917,8 +2993,16 @@ impl AppWindow {
             }
             "browser.show" => {
                 let agent = Self::arg(a, "terminal").unwrap_or_default();
+                // The pane goes in a space on the agent's machine; the user's
+                // own browser in the space it's shown in.
+                let machine = if agent.trim() == crate::browser::find::VIEW {
+                    let target = if Self::arg(a, "place") == Some("tab") { self.model.active.clone() } else { Self::owned(a, "pane").or_else(|| self.model.focused_pane()) };
+                    target.and_then(|t| self.model.space(&t).or_else(|| self.model.space_of(&t))).and_then(|s| s.machine.clone())
+                } else {
+                    crate::browser::find::split(agent.trim()).0.map(str::to_owned)
+                };
                 let r = place::Place::parse(Self::arg(a, "place"))
-                    .and_then(|p| self.require_document(crate::browser::find::split(agent.trim()).0).map(|_| p))
+                    .and_then(|p| self.require_document(machine.as_deref()).map(|_| p))
                     .and_then(|p| place::show(&mut self.model, agent, p, Self::owned(a, "pane")));
                 if r.is_ok() {
                     // Forces the next sync to hand the keyboard to the pane, new or existing.

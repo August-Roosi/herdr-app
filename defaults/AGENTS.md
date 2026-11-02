@@ -179,6 +179,22 @@ machine, and reconnects when it restarts. Until the agent browses it says
   The pane right-click menu has "Show browser" when the terminal has one.
 - `terminal: "base"` (`rohan/base`) is the login browser: log in there once
   and agents' browsers start with those cookies.
+- `terminal: "view"` is the person's own browser (`herdr-browser view`), on
+  this computer, with their own logins. It belongs to no machine: its pane
+  may sit in any space, a remote machine's too, and always shows this
+  computer's. It shows pages at their own size.
+- Agents ask through labels on their own terminal, local or remote, and
+  Herdr answers each new value once (what was there when Herdr started or a
+  machine connected is not news):
+  - `herdr.browser.mine=<n>` (`herdr-browser mine`): Herdr starts the view
+    browser if it isn't running and shows it beside the agent's pane.
+  - `herdr.browser.help=<message>` (`herdr-browser help`): a toast "<agent>
+    needs you in its browser: <message>" with **Open**, which shows the
+    agent's own browser. While it is set, the pane menu says "Help in
+    browser" instead of "Show browser". Empty: done.
+- A local agent's own browser shows beside its pane by itself when it
+  starts. Closed, it stays closed until that browser starts again. Remote
+  agents' browsers show only when asked (menu, help toast, `browser.show`).
 - It is a pane like a mod pane: it splits, zooms, closes and is saved with
   its tab, but has no terminal, so closing it ends nothing. Layouts can
   place one too: `{ "type": "block", "content": { "browser": "base" } }`.
@@ -583,8 +599,8 @@ The main ones:
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
 - Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`.
-- Browser: `browser.show {terminal, place?, pane?}` (an agent's browser in a pane;
-  see "Browser pane").
+- Browser: `browser.show {terminal, place?, pane?}` (an agent's browser in a pane,
+  `base`, or `view`, the person's own; see "Browser pane").
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),

@@ -57,7 +57,13 @@ agents:
 ```sh
 herdr-app do browser.show --terminal t7            # --place down | tab, --pane p12
 herdr-app do browser.show --terminal base
+herdr-app do browser.show --terminal view          # the person's own browser
 ```
+
+You don't need these to ask for the person's browser or help: `herdr-browser
+mine` and `herdr-browser help` set labels Herdr answers by itself (see
+`herdr-browser --skill`). A local agent's own browser shows beside its pane
+when it starts.
 
 `hc machine ls` lists machines. Use `hc run --on vps ...`, `hc exec --on vps ...`
 and `hc file ... --on vps ...` for remote work, not your local file tools.

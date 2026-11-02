@@ -70,8 +70,9 @@ fn map_node(node: &mut Node, map: &impl Fn(&str) -> String) {
     node.id = map(&node.id);
     match &mut node.kind {
         Kind::Block { content: Content::Terminal { terminal } } => *terminal = map(terminal),
-        // An agent address too: its space is on the agent's machine (browser::place).
-        Kind::Block { content: Content::Browser { browser } } => *browser = map(browser),
+        // An agent address too: its space is on the agent's machine
+        // (browser::place). The user's own browser belongs to no machine.
+        Kind::Block { content: Content::Browser { browser } } if browser != crate::browser::find::VIEW => *browser = map(browser),
         Kind::Stack { active: Some(active), .. } => *active = map(active),
         _ => {}
     }
@@ -261,6 +262,18 @@ mod tests {
         doc.replace(&mut m, Some("mac"));
         let pane = m.tab("mac/t").unwrap().root.find("mac/b").cloned().unwrap();
         assert_eq!(pane.content(), Some(&Content::Browser { browser: "mac/t1".into() }));
+        assert_eq!(doc, Document::capture(&m, Some("mac")));
+    }
+    #[test]
+    fn the_view_browser_block_has_no_machine() {
+        // The user's own browser runs on this screen's machine, whatever
+        // space shows it: its block is never qualified or unqualified.
+        let mut m = model();
+        m.split_with("p", Axis::Row, Node::block("b", Content::Browser { browser: "view".into() }));
+        let doc = Document::capture(&m, None);
+        doc.replace(&mut m, Some("mac"));
+        let pane = m.tab("mac/t").unwrap().root.find("mac/b").cloned().unwrap();
+        assert_eq!(pane.content(), Some(&Content::Browser { browser: "view".into() }));
         assert_eq!(doc, Document::capture(&m, Some("mac")));
     }
     #[test]

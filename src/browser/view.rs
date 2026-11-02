@@ -62,6 +62,12 @@ struct Shared {
 
 pub struct BrowserView {
     pub agent: String,
+    /// An agent's own browser (`t3`, `rohan/t3`, `base`), not the user's
+    /// (`view`, always this machine's: found among local terminals only and
+    /// reached through this computer's core, never `on` another). Only a cast
+    /// may ever fit the page's viewport to the pane (§10.5); a view pane
+    /// shows pages at their own size.
+    pub is_cast: bool,
     pub state: State,
     frame: Option<Frame>,
     /// Page targets, in the browser's order.
@@ -174,7 +180,7 @@ async fn pump(this: &WeakEntity<BrowserView>, rx: async_channel::Receiver<Source
 }
 
 impl BrowserView {
-    /// The pane for `agent` (`t3`, `rohan/t3`, `base`, `rohan/base`).
+    /// The pane for `agent` (`t3`, `rohan/t3`, `base`, `rohan/base`, `view`).
     pub fn new(core: Arc<Core>, agent: String, cx: &mut Context<Self>) -> Self {
         let mut view = Self::blank(agent, cx);
         view.start(core, cx);
@@ -193,6 +199,7 @@ impl BrowserView {
         })
         .detach();
         BrowserView {
+            is_cast: find::is_cast(&agent),
             agent,
             state: State::Connecting,
             frame: None,
@@ -655,7 +662,11 @@ impl Render for BrowserView {
         // While focused, the OS's text input (AltGr, dead keys, IMEs) types here.
         let input = self.focus.is_focused(window).then(|| (self.focus.clone(), cx.entity()));
         let (layout_shared, paint_shared) = (self.shared.clone(), self.shared.clone());
-        let status = state_text(&self.state).unwrap_or_else(|| format!("{} fps", self.fps()));
+        let status = match &self.state {
+            // The app starts the user's own browser: it's coming.
+            State::NoBrowser if !self.is_cast => "starting your browser…".into(),
+            state => state_text(state).unwrap_or_else(|| format!("{} fps", self.fps())),
+        };
         let empty = self.frame.is_none().then(|| status.clone());
 
         div()
@@ -716,6 +727,7 @@ impl Render for BrowserView {
                                 if shared.px != Some(dev) {
                                     shared.px = Some(dev);
                                     // Only the screencast's size: the page's viewport stays the agent's.
+                                    // (A cast may fit it to the pane later; `is_cast` says which.)
                                     if let Some(source) = &shared.source {
                                         source.resize(dev);
                                     }

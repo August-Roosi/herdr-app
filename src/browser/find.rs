@@ -21,6 +21,18 @@ pub enum Lookup {
     NoBrowser,
 }
 
+/// The user's own browser (`herdr-browser view`): always the one on this
+/// screen's machine, whichever space shows it. Its block is never qualified
+/// with a machine (mirror.rs), and it may sit in any space (place.rs).
+pub const VIEW: &str = "view";
+
+/// A cast: the live view of an agent's own browser (`t3`, `rohan/t3`,
+/// `base`), where the pane may fit the page to itself. The view browser shows
+/// pages at their own size and is never a cast.
+pub fn is_cast(agent: &str) -> bool {
+    agent != VIEW
+}
+
 /// `rohan/t3` → (`Some("rohan")`, `t3`); `t3` → (`None`, `t3`).
 pub fn split(address: &str) -> (Option<&str>, &str) {
     match address.split_once('/') {
@@ -102,6 +114,17 @@ mod tests {
         ]);
         assert_eq!(find_browser(&l, "base"), Some(Found { machine: None, port: 9400, terminal: "t4".into() }));
         assert_eq!(find_browser(&l, "rohan/base"), Some(Found { machine: Some("rohan".into()), port: 9401, terminal: "rohan/t5".into() }));
+    }
+
+    #[test]
+    fn the_view_browser_is_this_machines() {
+        let l = list(vec![
+            term("rohan/t5", json!({"browser-for": "view", "cdp": "127.0.0.1:9500"})),
+            term("t6", json!({"browser-for": "view", "cdp": "127.0.0.1:9600"})),
+        ]);
+        // Another machine's view browser is that machine's user's, not ours.
+        assert_eq!(find_browser(&l, VIEW), Some(Found { machine: None, port: 9600, terminal: "t6".into() }));
+        assert_eq!(find_browser(&list(vec![l["terminals"][0].clone()]), VIEW), None);
     }
 
     #[test]

@@ -28,17 +28,21 @@ impl Place {
     }
 }
 
-/// Shows `agent`'s browser (`t3`, `rohan/t3`, `base`) as a pane and focuses
-/// it; one it already has is focused instead. The pane goes in a space on the
-/// agent's machine: machine documents name agents relative to their machine.
+/// Shows `agent`'s browser (`t3`, `rohan/t3`, `base`, `view`) as a pane and
+/// focuses it; one it already has is focused instead. The pane goes in a
+/// space on the agent's machine: machine documents name agents relative to
+/// their machine. The user's own browser (`view`) goes in any space.
 /// Returns what `browser.show` answers.
 pub fn show(model: &mut Model, agent: &str, place: Place, pane: Option<String>) -> Result<Value, String> {
     let agent = agent.trim();
     let (machine, bare) = find::split(agent);
     if bare.is_empty() {
-        return Err("browser.show needs terminal: the agent (t3, rohan/t3) or base".into());
+        return Err("browser.show needs terminal: the agent (t3, rohan/t3), base or view".into());
     }
-    let on = |m: &Model, space: &str| m.space(space).is_some_and(|s| s.machine.as_deref() == machine);
+    let anywhere = agent == find::VIEW;
+    let on = |m: &Model, space: &str| m.space(space).is_some_and(|s| anywhere || s.machine.as_deref() == machine);
+    // The block's id is its space's machine's, like every block there.
+    let machine_of = |m: &Model, space: &str| m.space(space).and_then(|s| s.machine.clone());
     let elsewhere = || format!("{agent}'s browser goes in a space on {}", machine.unwrap_or("this computer"));
     let shown = model.tabs().flat_map(|c| c.root.panes()).find(|n| n.content() == Some(&block_content(agent))).map(|n| n.id.clone());
     if let Some(id) = shown {
@@ -53,7 +57,8 @@ pub fn show(model: &mut Model, agent: &str, place: Place, pane: Option<String>) 
             if !on(model, &space) {
                 return Err(elsewhere());
             }
-            let id = model.fresh_id_on("p", machine);
+            let on_machine = machine_of(model, &space);
+            let id = model.fresh_id_on("p", on_machine.as_deref());
             let axis = if place == Place::Right { Axis::Row } else { Axis::Column };
             model.split_with(&target, axis, block(&id));
             Ok(json!({ "pane": id }))
@@ -66,9 +71,10 @@ pub fn show(model: &mut Model, agent: &str, place: Place, pane: Option<String>) 
                 .and_then(|p| model.space_of(&p))
                 .map(|s| s.id.clone())
                 .or_else(|| model.active.clone().filter(|s| on(model, s)))
-                .or_else(|| model.spaces.iter().find(|s| s.machine.as_deref() == machine).map(|s| s.id.clone()))
+                .or_else(|| model.spaces.iter().find(|s| on(model, &s.id)).map(|s| s.id.clone()))
                 .ok_or_else(elsewhere)?;
-            let (tab, id) = (model.fresh_id_on("tb", machine), model.fresh_id_on("p", machine));
+            let on_machine = machine_of(model, &space);
+            let (tab, id) = (model.fresh_id_on("tb", on_machine.as_deref()), model.fresh_id_on("p", on_machine.as_deref()));
             model.add_tab(&space, Tab::with_pane(&tab, "browser", block(&id)));
             model.active = Some(space.clone());
             Ok(json!({ "space": space, "tab": tab, "pane": id }))
@@ -183,6 +189,34 @@ mod tests {
         assert!(show(&mut m, "rohan/base", Place::Tab, None).unwrap_err().contains("rohan"));
         assert!(show(&mut m, " ", Place::Right, None).is_err());
         assert_eq!(m.tab("c1").unwrap().root.panes().len(), 1);
+    }
+
+    #[test]
+    fn the_view_browser_goes_in_any_space() {
+        let mut m = model();
+        crate::mirror::Document::capture(&m, None).replace(&mut m, Some("rohan"));
+        // Beside a remote agent's pane: the block is the remote machine's
+        // (its id), the browser stays this screen's own.
+        let r = show(&mut m, "view", Place::Right, Some("rohan/x1".into())).unwrap();
+        let pane = r["pane"].as_str().unwrap().to_owned();
+        assert!(pane.starts_with("rohan/"), "{pane}");
+        assert_eq!(m.tab("rohan/c1").unwrap().root.find(&pane).unwrap().content().cloned(), browser("view"));
+        // Asked again (another agent, another space): the one it has is focused.
+        let again = show(&mut m, "view", Place::Right, Some("x1".into())).unwrap();
+        assert_eq!(again["pane"], json!(pane));
+        // A tab: in the shown space, wherever that is.
+        let mut m = model();
+        crate::mirror::Document::capture(&m, None).replace(&mut m, Some("rohan"));
+        m.active = Some("rohan/s1".into());
+        let r = show(&mut m, "view", Place::Tab, None).unwrap();
+        assert_eq!(r["space"], json!("rohan/s1"));
+        assert!(r["pane"].as_str().unwrap().starts_with("rohan/"));
+    }
+
+    #[test]
+    fn only_casts_change_the_page_viewport() {
+        assert!(!find::is_cast("view"));
+        assert!(find::is_cast("t1") && find::is_cast("rohan/t1") && find::is_cast("base"));
     }
 
     #[test]
