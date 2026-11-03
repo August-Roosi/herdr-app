@@ -1014,7 +1014,9 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // HERDR SPIKE: below child windows (an embedded CEF browser), not above them.
+        let topmost = std::env::var_os("HERDR_SPIKE_CEF").is_none();
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, topmost) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
