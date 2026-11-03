@@ -3,6 +3,7 @@ pub mod cdp;
 pub mod find;
 pub mod http;
 pub mod input;
+pub mod omnibox;
 pub mod place;
 pub mod requests;
 pub mod source;

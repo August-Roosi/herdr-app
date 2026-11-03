@@ -78,6 +78,8 @@ pub struct BrowserView {
     url: String,
     /// The URL bar's text while it is being edited.
     editing: Option<String>,
+    /// The URL bar's text is all selected: the next edit replaces it.
+    selected: bool,
     /// An IME's text being composed (not sent yet).
     marked: Option<String>,
     /// Show the newest page (else the one picked in the tab strip).
@@ -213,6 +215,7 @@ impl BrowserView {
             shown: None,
             url: String::new(),
             editing: None,
+            selected: false,
             marked: None,
             follow: true,
             was_live: false,
@@ -430,7 +433,12 @@ impl BrowserView {
             return;
         }
         match self.editing.as_mut() {
-            Some(url) => url.push_str(text),
+            Some(url) => {
+                if std::mem::take(&mut self.selected) {
+                    url.clear();
+                }
+                url.push_str(text)
+            }
             None => self.send(PageInput::Text(text.to_owned())),
         }
         cx.notify();
@@ -448,16 +456,28 @@ impl BrowserView {
     fn edit_url(&mut self, k: &Keystroke, cx: &mut Context<Self>) {
         let Some(text) = self.editing.as_mut() else { return };
         let m = &k.modifiers;
+        let replaces = match k.key.as_str() {
+            "backspace" => true,
+            "v" => m.control || m.platform,
+            _ => !(m.control || m.alt || m.platform) && input::text(k).is_some(),
+        };
+        if replaces && std::mem::take(&mut self.selected) {
+            text.clear();
+        }
         match k.key.as_str() {
             "enter" => {
-                let url = go_url(text);
+                let url = super::omnibox::resolve(text);
                 self.editing = None;
+                self.selected = false;
                 if !url.is_empty() {
                     self.url = url.clone();
                     self.send(PageInput::Nav(Nav::Go(url)));
                 }
             }
-            "escape" => self.editing = None,
+            "escape" => {
+                self.editing = None;
+                self.selected = false;
+            }
             "backspace" => {
                 text.pop();
             }
@@ -507,6 +527,7 @@ impl BrowserView {
                 }))
         });
         let url = match &self.editing {
+            Some(text) if self.selected => text.clone(),
             Some(text) => format!("{text}▏"),
             None => self.url.clone(),
         };
@@ -535,11 +556,12 @@ impl BrowserView {
                     .whitespace_nowrap()
                     .px_1()
                     .rounded_sm()
-                    .bg(c("input"))
+                    .bg(if self.editing.is_some() && self.selected { c("selected") } else { c("input") })
                     .text_color(if self.editing.is_some() { c("foreground") } else { c("muted") })
                     .child(url)
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.editing = Some(view.url.clone());
+                        view.selected = true;
                         view.focus.focus(window, cx);
                         cx.notify();
                     })),
@@ -595,16 +617,6 @@ pub fn key_input(k: &Keystroke, down: bool) -> Option<PageInput> {
         return down.then_some(PageInput::Text(text));
     }
     (!input::key_event(k, down).is_empty()).then(|| PageInput::Key { keystroke: k.clone(), down })
-}
-
-/// What the URL bar's text navigates to: a bare host gets a scheme.
-pub fn go_url(text: &str) -> String {
-    let t = text.trim();
-    if t.is_empty() || t.contains("://") || ["about:", "data:", "file:", "chrome:", "javascript:"].iter().any(|s| t.starts_with(s)) {
-        return t.to_owned();
-    }
-    let local = ["localhost", "127.", "0.0.0.0", "[::1]"].iter().any(|h| t.starts_with(h));
-    format!("{}://{t}", if local { "http" } else { "https" })
 }
 
 /// The largest rect of `image`'s aspect that fits `area`, centered.
@@ -703,6 +715,7 @@ impl Render for BrowserView {
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, ev: &MouseDownEvent, window, cx| {
                         view.focus.focus(window, cx);
                         if view.editing.take().is_some() {
+                            view.selected = false;
                             cx.notify();
                         }
                         view.mouse(MouseKind::Down, Some(ev.button), ev.position, ev.click_count);
@@ -873,16 +886,6 @@ mod tests {
         assert!(matches!(key_input(&ks("enter"), false), Some(PageInput::Key { down: false, .. })));
         assert!(matches!(key_input(&ks("backspace"), true), Some(PageInput::Key { .. })));
         assert!(matches!(key_input(&ks("space"), true), Some(PageInput::Text(t)) if t == " "));
-    }
-
-    #[test]
-    fn urls_get_a_scheme() {
-        assert_eq!(go_url(" localhost:3000/x "), "http://localhost:3000/x");
-        assert_eq!(go_url("127.0.0.1:8080"), "http://127.0.0.1:8080");
-        assert_eq!(go_url("example.com"), "https://example.com");
-        assert_eq!(go_url("http://example.com"), "http://example.com");
-        assert_eq!(go_url("about:blank"), "about:blank");
-        assert_eq!(go_url("  "), "");
     }
 
     #[test]
