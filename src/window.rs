@@ -3983,7 +3983,9 @@ impl AppWindow {
         }
         el = shadow(el, f.shadow.as_deref());
         let body = div().flex_1().min_h_0().flex().child(inner);
-        let Some(h) = &f.header else { return el.child(body).into_any_element() };
+        // A browser pane has its own top bar; a header above it would be an empty strip.
+        let browser = matches!(n.content(), Some(Content::Browser { .. }));
+        let Some(h) = f.header.as_ref().filter(|_| !browser) else { return el.child(body).into_any_element() };
         let head = div().flex_none().h(settings::z(h.height.unwrap_or(HEADER_HEIGHT))).w_full().flex()
             .child(self.render_slot(&format!("{}#frame", n.id), cx));
         if h.hover() {
@@ -4060,7 +4062,8 @@ impl AppWindow {
                 }
             }
         };
-        let row = frame.and_then(|f| f.header.as_ref()).filter(|h| !h.bottom() && !h.hover()).map(|h| h.height.unwrap_or(HEADER_HEIGHT));
+        let browser = matches!(n.content(), Some(Content::Browser { .. }));
+        let row = frame.and_then(|f| f.header.as_ref()).filter(|h| !browser && !h.bottom() && !h.hover()).map(|h| h.height.unwrap_or(HEADER_HEIGHT));
         el.children(self.render_floats(n, cx)).children(self.pane_grip(&n.id, row, cx)).into_any_element()
     }
 
