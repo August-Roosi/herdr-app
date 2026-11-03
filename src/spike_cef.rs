@@ -19,6 +19,7 @@ mod imp {
         created: bool,
         from_pane: bool,
         rect: (i32, i32, i32, i32),
+        want: (i32, i32, i32, i32),
     }
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -68,7 +69,7 @@ mod imp {
         let ok = initialize(Some(args.as_main_args()), Some(&settings), None::<&mut App>, std::ptr::null_mut());
         log(&format!("cef initialize -> {ok} (url {url})"));
         if ok == 1 {
-            *STATE.lock().unwrap() = Some(State { url, created: false, from_pane: false, rect: (0, 0, 0, 0) });
+            *STATE.lock().unwrap() = Some(State { url, created: false, from_pane: false, rect: (-1, -1, -1, -1), want: (0, 0, 0, 0) });
         }
     }
 
@@ -96,9 +97,9 @@ mod imp {
             (f32::from(bounds.size.height) * s).round().max(1.0) as i32,
         );
         state.from_pane |= pane;
+        let parent_n = parent as usize;
         if !state.created {
             state.created = true;
-            state.rect = rect;
             let info = WindowInfo::default().set_as_child(
                 sys::HWND(parent as _),
                 &Rect { x: rect.0, y: rect.1, width: rect.2, height: rect.3 },
@@ -113,19 +114,47 @@ mod imp {
                 None,
             );
             log(&format!("create_browser -> {r} at {rect:?} (pane {pane}, scale {s})"));
-            return;
+            // The child window shows up a moment later, and GPUI may not paint
+            // again by then: keep placing it until it exists.
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if apply(parent_n) {
+                        break;
+                    }
+                }
+            });
         }
-        if state.rect == rect {
-            return;
+        state.want = rect;
+        drop(guard);
+        apply(parent_n);
+    }
+
+    /// Moves CEF's child window to the wanted rect; false while it doesn't exist.
+    fn apply(parent: usize) -> bool {
+        let parent = parent as windows_sys::Win32::Foundation::HWND;
+        let mut child = std::ptr::null_mut();
+        // Chrome runtime style: Chrome_WidgetWin_1; Alloy: CefBrowserWindow.
+        for class in ["Chrome_WidgetWin_1\0", "CefBrowserWindow\0"] {
+            let class: Vec<u16> = class.encode_utf16().collect();
+            child = unsafe { FindWindowExW(parent, std::ptr::null_mut(), class.as_ptr(), std::ptr::null()) };
+            if !child.is_null() {
+                break;
+            }
         }
-        let class: Vec<u16> = "CefBrowserWindow\0".encode_utf16().collect();
-        let child = unsafe { FindWindowExW(parent, std::ptr::null_mut(), class.as_ptr(), std::ptr::null()) };
         if child.is_null() {
-            return; // not created yet: the next paint tries again
+            return false;
         }
+        let mut guard = STATE.lock().unwrap();
+        let Some(state) = guard.as_mut() else { return true };
+        if state.rect == state.want {
+            return true;
+        }
+        let rect = state.want;
         state.rect = rect;
         unsafe { SetWindowPos(child, std::ptr::null_mut(), rect.0, rect.1, rect.2, rect.3, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) };
-        log(&format!("moved to {rect:?} (pane {pane})"));
+        log(&format!("moved to {rect:?}"));
+        true
     }
 }
 
