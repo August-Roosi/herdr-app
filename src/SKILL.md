@@ -44,8 +44,7 @@ herdr-app do space.new --name "remote api" --machine vps --folder /srv/api
 ```
 
 The folder is on that machine; tabs and splits in the space stay there.
-New-space keys and clicks follow the focused space's machine. Script commands
-without `--machine` still use this computer; `--machine ''` explicitly chooses it.
+New-space keys and clicks, and script commands without `--machine`, use this computer; `--machine ''` explicitly chooses it.
 The agent menu checks and starts agents in the remote Unix user's
 login/interactive shell (sh, bash, zsh, dash, ksh or fish), including its
 configured PATH. Other shells keep the sh launcher.

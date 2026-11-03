@@ -2813,7 +2813,7 @@ impl AppWindow {
             crate::telemetry::command(command.name);
         }
         if name == "space.new" {
-            let machine = new_space_machine(&args, person, &self.model);
+            let machine = new_space_machine(&args);
             if !args.is_object() { args = json!({}); }
             args["machine"] = json!(machine);
         }
@@ -4639,10 +4639,8 @@ fn needs_model_pane(name: &str, args: &Value) -> bool {
     }
 }
 
-fn new_space_machine(args: &Value, person: bool, model: &Model) -> Option<String> {
-    args.get("machine").and_then(Value::as_str)
-        .or_else(|| if person { model.active_space().and_then(|s| s.machine.as_deref()) } else { None })
-        .filter(|m| !m.is_empty()).map(str::to_owned)
+fn new_space_machine(args: &Value) -> Option<String> {
+    args.get("machine").and_then(Value::as_str).filter(|m| !m.is_empty()).map(str::to_owned)
 }
 
 fn home() -> String {
@@ -4998,24 +4996,12 @@ mod tests {
     }
 
     #[test]
-    fn new_spaces_follow_the_persons_active_machine_but_keep_explicit_targets() {
+    fn new_spaces_are_local_unless_a_machine_is_named() {
         use serde_json::json;
-        let mut model = crate::model::Model::default();
-        assert_eq!(super::new_space_machine(&json!({}), true, &model), None);
-        model.add_space("remote", "", "", crate::model::Tab::new("tab", "", "pane", "second/t1"));
-        model.space_mut("remote").unwrap().machine = Some("second".into());
-        for args in [json!({}), json!({"machine": null})] {
-            assert_eq!(super::new_space_machine(&args, true, &model).as_deref(), Some("second"));
-            assert_eq!(super::new_space_machine(&args, false, &model), None);
-        }
-        for person in [true, false] {
-            assert_eq!(super::new_space_machine(&json!({"machine": "other"}), person, &model).as_deref(), Some("other"));
-            assert_eq!(super::new_space_machine(&json!({"machine": ""}), person, &model), None);
-        }
-        model.add_space("local", "", "", crate::model::Tab::new("local-tab", "", "local-pane", "t1"));
-        assert_eq!(super::new_space_machine(&json!({}), true, &model), None);
-        model.active = Some("remote".into());
-        assert_eq!(super::new_space_machine(&json!({}), true, &model).as_deref(), Some("second"));
+        assert_eq!(super::new_space_machine(&json!({})), None);
+        assert_eq!(super::new_space_machine(&json!({"machine": null})), None);
+        assert_eq!(super::new_space_machine(&json!({"machine": "other"})).as_deref(), Some("other"));
+        assert_eq!(super::new_space_machine(&json!({"machine": ""})), None);
     }
 
     #[gpui::test]
