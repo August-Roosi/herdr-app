@@ -27,6 +27,7 @@ mod remote_shell;
 mod settings;
 mod setup;
 mod sound;
+mod spike_cef;
 mod spawn;
 mod sprites;
 mod telemetry;
@@ -76,6 +77,8 @@ fn attach_console() {
 }
 
 fn main() {
+    // SPIKE: CEF helper processes are this program with --type=...
+    spike_cef::subprocess();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(windows)]
     if args.len() > 1 {
@@ -117,6 +120,7 @@ fn main() {
         return;
     }
 
+    spike_cef::init();
     telemetry::clock();
     // A first start sizes the app to the screen and the system's text size.
     let fresh = !settings::path().exists();

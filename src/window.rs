@@ -4824,6 +4824,11 @@ impl Render for AppWindow {
         crate::bench::frame_start();
         crate::terminal::next_frame();
         window.set_rem_size(px(settings::ui_font_size()));
+        // SPIKE: until a browser pane shows, the CEF browser sits in the right half.
+        {
+            let vs = window.viewport_size();
+            crate::spike_cef::place(window, Bounds::new(point(vs.width / 2.0, px(80.0)), size(vs.width / 2.0 - px(16.0), vs.height - px(120.0))), false);
+        }
         // A terminal the person clicked into becomes the focused pane.
         let clicked = self
             .terms

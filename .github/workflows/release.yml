@@ -129,6 +129,21 @@ jobs:
           APPLE_CERTIFICATE_P12: ${{ runner.os == 'macOS' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_P12 || '' }}
           APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
         run: scripts/package
+      # SPIKE: herdr-app.exe with the CEF runtime cef-dll-sys copied beside it.
+      - name: Spike CEF bundle
+        if: runner.os == 'Windows'
+        run: |
+          cd target/release
+          ls -la
+          tar -czf ../../dist/spike-cef-windows.tar.gz herdr-app.exe *.dll *.pak *.bin *.dat *.json locales
+          du -sh ../../dist/spike-cef-windows.tar.gz
+          du -ch herdr-app.exe *.dll *.pak *.bin *.dat *.json locales | tail -1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'Windows'
+        with:
+          name: spike-cef-windows
+          path: dist/spike-cef-windows.tar.gz
+          retention-days: 3
       - name: Verify release notices
         run: |
           archive="dist/herdr-app-${{ matrix.target }}.tar.gz"

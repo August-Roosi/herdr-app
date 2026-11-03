@@ -748,6 +748,7 @@ impl Render for BrowserView {
                     .child(
                         canvas(
                             move |bounds, window, _| {
+                                crate::spike_cef::place(window, bounds, true);
                                 let scale = window.scale_factor();
                                 let dev = ((f32::from(bounds.size.width) * scale).round().max(1.0) as u32, (f32::from(bounds.size.height) * scale).round().max(1.0) as u32);
                                 let mut shared = layout_shared.borrow_mut();
