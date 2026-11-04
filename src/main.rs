@@ -217,7 +217,28 @@ pub fn open_main(core: std::sync::Arc<hc::Core>, requests: async_channel::Receiv
                 app_id: Some(std::env::var("HERDR_APP_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr-app".into())),
                 ..Default::default()
             };
-            cx.open_window(options, |window, cx| cx.new(|cx| window::AppWindow::new(core, requests, window, cx)))
+            let handle = cx.open_window(options, |window, cx| cx.new(|cx| window::AppWindow::new(core, requests, window, cx)))
                 .expect("cannot open the Herdr window");
-            cx.activate(true);
+            // SPIKE: tell a test script the window's HWND; don't steal focus then.
+            match std::env::var_os("HERDR_DEBUG_HWND_FILE") {
+                Some(file) => debug_hwnd_file(handle, file, cx),
+                None => cx.activate(true),
+            }
+}
+
+/// SPIKE: writes the window's HWND (decimal) to `file`.
+fn debug_hwnd_file(handle: WindowHandle<window::AppWindow>, file: std::ffi::OsString, cx: &mut App) {
+    let _ = handle.update(cx, |_, window, _| {
+        #[cfg(windows)]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = HasWindowHandle::window_handle(window) {
+                if let RawWindowHandle::Win32(h) = h.as_raw() {
+                    let _ = std::fs::write(&file, h.hwnd.get().to_string());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (window, &file);
+    });
 }

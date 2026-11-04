@@ -1014,7 +1014,8 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // HERDR SPIKE: compose below child windows (a cross-process CEF browser).
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
